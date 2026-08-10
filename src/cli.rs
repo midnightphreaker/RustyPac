@@ -33,10 +33,7 @@ where
         [option] if option == "--enable" => Ok(Command::Enable),
         [option] if option == "--disable" => Ok(Command::Disable),
         [url, output]
-            if url != "--enable"
-                && url != "--disable"
-                && output != "--enable"
-                && output != "--disable" =>
+            if !url.starts_with("--") && output != "--enable" && output != "--disable" =>
         {
             Ok(Command::Download {
                 url: url.clone(),

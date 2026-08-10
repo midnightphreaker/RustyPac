@@ -71,3 +71,8 @@ fn rejects_mixed_option_and_download_arguments() {
         assert!(parse(arguments).is_err(), "{arguments:?} must be rejected");
     }
 }
+
+#[test]
+fn rejects_unknown_option_with_output_argument() {
+    assert!(parse(&["RustyPac", "--unknown", "output.part"]).is_err());
+}
