@@ -268,12 +268,12 @@ impl Fields {
 }
 
 fn structured_minimum_width(model: &ProgressModel, fields: &Fields, mode: LayoutMode) -> usize {
-    UnicodeWidthStr::width(structured_row(model, fields, mode, MIN_FILENAME_WIDTH).as_str())
+    display_width(structured_row(model, fields, mode, MIN_FILENAME_WIDTH).as_str())
 }
 
 fn plain_minimum_width(model: &ProgressModel, fields: &Fields) -> usize {
-    let filename_width = UnicodeWidthStr::width(model.filename.as_str()).min(MIN_FILENAME_WIDTH);
-    UnicodeWidthStr::width(plain_row_with_filename_width(model, fields, filename_width).as_str())
+    let filename_width = display_width(model.filename.as_str()).min(MIN_FILENAME_WIDTH);
+    display_width(plain_row_with_filename_width(model, fields, filename_width).as_str())
 }
 
 fn structured_row(
@@ -314,7 +314,7 @@ fn structured_row(
 }
 
 fn plain_row(model: &ProgressModel, fields: &Fields, width: usize) -> String {
-    let fixed_width = UnicodeWidthStr::width(plain_suffix(fields).as_str()) + icon_width(model) + 1;
+    let fixed_width = display_width(plain_suffix(fields).as_str()) + icon_width(model) + 1;
     let filename_width = width.saturating_sub(fixed_width);
     plain_row_with_filename_width(model, fields, filename_width)
 }
@@ -338,7 +338,7 @@ fn plain_suffix(fields: &Fields) -> String {
 
 fn padded_prefix(model: &ProgressModel, filename_width: usize) -> String {
     let filename = truncate_end(&model.filename, filename_width);
-    let padding = filename_width.saturating_sub(UnicodeWidthStr::width(filename.as_str()));
+    let padding = filename_width.saturating_sub(display_width(filename.as_str()));
     format!("{} {filename}{}", icon(model.state), " ".repeat(padding))
 }
 
@@ -351,7 +351,13 @@ fn icon(state: DisplayState) -> &'static str {
 }
 
 fn icon_width(model: &ProgressModel) -> usize {
-    UnicodeWidthStr::width(icon(model.state))
+    display_width(icon(model.state))
+}
+
+fn display_width(text: &str) -> usize {
+    // Ghostty renders this fallback as a chain glyph plus an explosion glyph,
+    // even though Unicode classifies the joined sequence as two cells.
+    UnicodeWidthStr::width(text) + text.matches("⛓️‍💥").count() * 2
 }
 
 fn percentage(model: &ProgressModel) -> String {
@@ -427,7 +433,7 @@ fn format_duration(duration: std::time::Duration) -> String {
 }
 
 fn truncate_end(text: &str, target_width: usize) -> String {
-    if UnicodeWidthStr::width(text) <= target_width {
+    if display_width(text) <= target_width {
         return text.to_owned();
     }
     if target_width <= 3 {
@@ -438,13 +444,13 @@ fn truncate_end(text: &str, target_width: usize) -> String {
     let mut end = 0;
     for (index, character) in text.char_indices() {
         let candidate_end = index + character.len_utf8();
-        if UnicodeWidthStr::width(&text[..candidate_end]) > content_width {
+        if display_width(&text[..candidate_end]) > content_width {
             break;
         }
         end = candidate_end;
     }
     let prefix = &text[..end];
-    let padding = content_width - UnicodeWidthStr::width(prefix);
+    let padding = content_width - display_width(prefix);
     format!("{prefix}{}...", " ".repeat(padding))
 }
 

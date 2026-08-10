@@ -131,7 +131,7 @@ fn formats_approved_skipped_rows_with_unavailable_fields() {
         "⛓️‍💥 core.db.sig              ▐                       N/A   ▐       N/A           ▐     N/A      ▐  N/A",
         "⛓️‍💥 core.db.sig N/A",
     ] {
-        assert_eq!(format_row(&model, width(expected), false), expected);
+        assert_eq!(format_row(&model, ghostty_width(expected), false), expected);
     }
 }
 
