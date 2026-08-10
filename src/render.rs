@@ -125,6 +125,20 @@ where
         Ok(())
     }
 
+    pub fn suspend(&mut self, model: &ProgressModel) -> io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+
+        let now = self.clock.now();
+        let terminal = self.terminal_probe.probe();
+        let row = format_row(model, terminal.width, terminal.is_terminal);
+        self.write_row(&row, terminal.is_terminal, true)?;
+        self.last_row = None;
+        self.last_draw = Some(now);
+        Ok(())
+    }
+
     fn write_row(&mut self, row: &str, is_terminal: bool, finish: bool) -> io::Result<()> {
         if is_terminal {
             write!(self.writer, "\r{row}\x1b[K")?;

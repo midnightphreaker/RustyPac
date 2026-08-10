@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 #[path = "../src/progress.rs"]
 mod progress;
+#[allow(dead_code)]
 #[path = "../src/render.rs"]
 mod render;
 

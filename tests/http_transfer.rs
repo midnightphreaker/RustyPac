@@ -1,5 +1,7 @@
+#[allow(dead_code)]
 #[path = "../src/download.rs"]
 mod download;
+#[allow(dead_code)]
 #[path = "support/http_server.rs"]
 mod http_server;
 #[allow(dead_code)]

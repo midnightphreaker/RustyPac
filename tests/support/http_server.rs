@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -58,6 +58,7 @@ impl RecordedRequest {
 pub struct HttpServer {
     address: SocketAddr,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    bytes_sent: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -70,8 +71,10 @@ impl HttpServer {
             .expect("set test listener nonblocking");
         let address = listener.local_addr().expect("read test server address");
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let bytes_sent = Arc::new(AtomicU64::new(0));
         let stopping = Arc::new(AtomicBool::new(false));
         let server_requests = Arc::clone(&requests);
+        let server_bytes_sent = Arc::clone(&bytes_sent);
         let server_stopping = Arc::clone(&stopping);
 
         let thread = thread::spawn(move || {
@@ -82,8 +85,9 @@ impl HttpServer {
                     Ok((stream, _)) => {
                         let config = Arc::clone(&config);
                         let requests = Arc::clone(&server_requests);
+                        let bytes_sent = Arc::clone(&server_bytes_sent);
                         connections.push(thread::spawn(move || {
-                            let _ = serve_connection(stream, &config, &requests);
+                            let _ = serve_connection(stream, &config, &requests, &bytes_sent);
                         }));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -100,6 +104,7 @@ impl HttpServer {
         Self {
             address,
             requests,
+            bytes_sent,
             stopping,
             thread: Some(thread),
         }
@@ -111,6 +116,10 @@ impl HttpServer {
 
     pub fn requests(&self) -> Vec<RecordedRequest> {
         self.requests.lock().expect("request log lock").clone()
+    }
+
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent.load(Ordering::Acquire)
     }
 }
 
@@ -128,6 +137,7 @@ fn serve_connection(
     mut stream: TcpStream,
     config: &ServerConfig,
     requests: &Mutex<Vec<RecordedRequest>>,
+    bytes_sent: &AtomicU64,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let request = read_request(&stream)?;
@@ -141,9 +151,11 @@ fn serve_connection(
     }
 
     match config.mode {
-        ResponseMode::Ranges => write_range_response(&mut stream, config, &request),
-        ResponseMode::IgnoreRanges => write_known_response(&mut stream, config, 200, &config.body),
-        ResponseMode::UnknownLength => write_unknown_response(&mut stream, config),
+        ResponseMode::Ranges => write_range_response(&mut stream, config, &request, bytes_sent),
+        ResponseMode::IgnoreRanges => {
+            write_known_response(&mut stream, config, 200, &config.body, bytes_sent)
+        }
+        ResponseMode::UnknownLength => write_unknown_response(&mut stream, config, bytes_sent),
         ResponseMode::Status(status) => write_status(&mut stream, status),
     }
 }
@@ -176,9 +188,10 @@ fn write_range_response(
     stream: &mut TcpStream,
     config: &ServerConfig,
     request: &RecordedRequest,
+    bytes_sent: &AtomicU64,
 ) -> std::io::Result<()> {
     let Some(range) = request.header("range") else {
-        return write_known_response(stream, config, 200, &config.body);
+        return write_known_response(stream, config, 200, &config.body, bytes_sent);
     };
     let Some((start, end)) = parse_range(range, config.body.len()) else {
         write!(
@@ -195,7 +208,13 @@ fn write_range_response(
         body.len(),
         config.body.len()
     )?;
-    write_body(stream, body, config.chunk_size, config.chunk_delay)
+    write_body(
+        stream,
+        body,
+        config.chunk_size,
+        config.chunk_delay,
+        bytes_sent,
+    )
 }
 
 fn parse_range(value: &str, total: usize) -> Option<(usize, usize)> {
@@ -216,16 +235,27 @@ fn write_known_response(
     config: &ServerConfig,
     status: u16,
     body: &[u8],
+    bytes_sent: &AtomicU64,
 ) -> std::io::Result<()> {
     write!(
         stream,
         "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nETag: \"rustypac-fixture\"\r\nLast-Modified: Sat, 01 Aug 2026 00:00:00 GMT\r\nConnection: close\r\n\r\n",
         body.len()
     )?;
-    write_body(stream, body, config.chunk_size, config.chunk_delay)
+    write_body(
+        stream,
+        body,
+        config.chunk_size,
+        config.chunk_delay,
+        bytes_sent,
+    )
 }
 
-fn write_unknown_response(stream: &mut TcpStream, config: &ServerConfig) -> std::io::Result<()> {
+fn write_unknown_response(
+    stream: &mut TcpStream,
+    config: &ServerConfig,
+    bytes_sent: &AtomicU64,
+) -> std::io::Result<()> {
     stream
         .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")?;
     for chunk in config.body.chunks(config.chunk_size.max(1)) {
@@ -234,6 +264,7 @@ fn write_unknown_response(stream: &mut TcpStream, config: &ServerConfig) -> std:
         }
         write!(stream, "{:x}\r\n", chunk.len())?;
         stream.write_all(chunk)?;
+        bytes_sent.fetch_add(chunk.len() as u64, Ordering::Release);
         stream.write_all(b"\r\n")?;
         stream.flush()?;
     }
@@ -259,12 +290,14 @@ fn write_body(
     body: &[u8],
     chunk_size: usize,
     chunk_delay: Duration,
+    bytes_sent: &AtomicU64,
 ) -> std::io::Result<()> {
     for chunk in body.chunks(chunk_size.max(1)) {
         if !chunk_delay.is_zero() {
             thread::sleep(chunk_delay);
         }
         stream.write_all(chunk)?;
+        bytes_sent.fetch_add(chunk.len() as u64, Ordering::Release);
         stream.flush()?;
     }
     Ok(())

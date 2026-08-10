@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bytehaul::{
-    DownloadError, DownloadSpec, DownloadState, Downloader, FileAllocation, ProgressSnapshot,
+    DownloadError, DownloadHandle, DownloadSpec, DownloadState, Downloader, FileAllocation,
+    ProgressSnapshot,
 };
-use tokio::sync::watch;
+use tokio::sync::mpsc;
 
 use crate::lock::OutputLock;
 use crate::progress::{DisplayState, ProgressModel};
@@ -22,23 +23,25 @@ pub enum DownloadOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ControlRequest {
-    Running,
     Interrupt,
+    Suspend,
+    Continue,
+    Resize,
 }
 
 #[derive(Clone)]
 pub struct ControlHandle {
-    sender: watch::Sender<ControlRequest>,
+    sender: mpsc::UnboundedSender<ControlRequest>,
 }
 
 pub struct ControlEvents {
-    receiver: watch::Receiver<ControlRequest>,
+    receiver: mpsc::UnboundedReceiver<ControlRequest>,
     #[cfg(test)]
     defer_interrupt_until_terminal: bool,
 }
 
 pub fn control_channel() -> (ControlHandle, ControlEvents) {
-    let (sender, receiver) = watch::channel(ControlRequest::Running);
+    let (sender, receiver) = mpsc::unbounded_channel();
     (
         ControlHandle { sender },
         ControlEvents {
@@ -51,7 +54,7 @@ pub fn control_channel() -> (ControlHandle, ControlEvents) {
 
 #[cfg(test)]
 pub fn terminal_boundary_control_channel() -> (ControlHandle, ControlEvents) {
-    let (sender, receiver) = watch::channel(ControlRequest::Running);
+    let (sender, receiver) = mpsc::unbounded_channel();
     (
         ControlHandle { sender },
         ControlEvents {
@@ -65,6 +68,23 @@ impl ControlHandle {
     pub fn interrupt(&self) {
         let _ = self.sender.send(ControlRequest::Interrupt);
     }
+
+    pub fn suspend(&self) {
+        let _ = self.sender.send(ControlRequest::Suspend);
+    }
+
+    pub fn continue_transfer(&self) {
+        let _ = self.sender.send(ControlRequest::Continue);
+    }
+
+    pub fn resize(&self) {
+        let _ = self.sender.send(ControlRequest::Resize);
+    }
+}
+
+enum TransferCycle {
+    Finished(Result<(), DownloadError>),
+    Suspended,
 }
 
 pub async fn run<W, P, C>(
@@ -94,73 +114,65 @@ where
         }
     };
 
-    let downloader = match Downloader::builder().build() {
-        Ok(downloader) => downloader,
-        Err(_) => {
-            return finish(
-                renderer,
-                &mut model,
-                DisplayState::Error,
-                DownloadOutcome::Failed,
-            )
-        }
-    };
-    let spec = DownloadSpec::new(url)
-        .output_path(output.to_owned())
-        .file_allocation(FileAllocation::None);
-    let handle = downloader.download(spec);
-    let mut progress = handle.subscribe_progress();
-
-    if renderer.update(&model, false).is_err() {
-        handle.cancel();
-        let _ = handle.wait().await;
-        return DownloadOutcome::Failed;
-    }
-
-    let mut events_open = true;
     #[cfg(test)]
     let defer_interrupt_until_terminal = events.defer_interrupt_until_terminal;
     #[cfg(not(test))]
     let defer_interrupt_until_terminal = false;
-    let result = if defer_interrupt_until_terminal {
-        let mut terminal_observer = progress.clone();
-        while !is_terminal(terminal_observer.borrow().state) {
-            if terminal_observer.changed().await.is_err() {
-                break;
+    let mut first_cycle = true;
+    let result = loop {
+        let downloader = match Downloader::builder().build() {
+            Ok(downloader) => downloader,
+            Err(_) => {
+                return finish(
+                    renderer,
+                    &mut model,
+                    DisplayState::Error,
+                    DownloadOutcome::Failed,
+                )
             }
-        }
-        if events.receiver.changed().await.is_ok()
-            && *events.receiver.borrow_and_update() == ControlRequest::Interrupt
-        {
+        };
+        let spec = DownloadSpec::new(url)
+            .output_path(output.to_owned())
+            .file_allocation(FileAllocation::None);
+        let handle = downloader.download(spec);
+        let progress = handle.subscribe_progress();
+
+        model.state = DisplayState::Active;
+        if renderer.update(&model, !first_cycle).is_err() {
             handle.cancel();
+            let _ = handle.wait().await;
+            return DownloadOutcome::Failed;
         }
-        handle.wait().await
-    } else {
-        loop {
-            tokio::select! {
-                changed = progress.changed() => {
-                    if changed.is_err() {
-                        break handle.wait().await;
-                    }
-                    let snapshot = progress.borrow_and_update().clone();
-                    apply_snapshot(&mut model, &snapshot, started.elapsed());
-                    if renderer.update(&model, false).is_err() {
-                        handle.cancel();
-                        break handle.wait().await;
-                    }
-                    if is_terminal(snapshot.state) {
-                        break handle.wait().await;
-                    }
+        first_cycle = false;
+
+        let cycle = if defer_interrupt_until_terminal {
+            drive_terminal_boundary(handle, progress, &mut events).await
+        } else {
+            drive_transfer(handle, progress, &mut events, renderer, &mut model, started).await
+        };
+
+        match cycle {
+            TransferCycle::Finished(result) => break result,
+            TransferCycle::Suspended => {
+                model.state = DisplayState::Paused;
+                if renderer.suspend(&model).is_err() {
+                    return finish(
+                        renderer,
+                        &mut model,
+                        DisplayState::Error,
+                        DownloadOutcome::Failed,
+                    );
                 }
-                changed = events.receiver.changed(), if events_open => {
-                    match changed {
-                        Ok(()) if *events.receiver.borrow_and_update() == ControlRequest::Interrupt => {
-                            handle.cancel();
-                            break handle.wait().await;
-                        }
-                        Ok(()) => {}
-                        Err(_) => events_open = false,
-                    }
+
+                // SAFETY: SIGSTOP is valid and has no user-defined handler. The call
+                // returns only after another process delivers SIGCONT.
+                if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+                    return finish(
+                        renderer,
+                        &mut model,
+                        DisplayState::Error,
+                        DownloadOutcome::Failed,
+                    );
                 }
             }
         }
@@ -204,6 +216,92 @@ where
             DisplayState::Error,
             DownloadOutcome::Failed,
         ),
+    }
+}
+
+async fn drive_terminal_boundary(
+    handle: DownloadHandle,
+    mut progress: tokio::sync::watch::Receiver<ProgressSnapshot>,
+    events: &mut ControlEvents,
+) -> TransferCycle {
+    while !is_terminal(progress.borrow().state) {
+        if progress.changed().await.is_err() {
+            break;
+        }
+    }
+    if events.receiver.recv().await == Some(ControlRequest::Interrupt) {
+        handle.cancel();
+    }
+    TransferCycle::Finished(handle.wait().await)
+}
+
+async fn drive_transfer<W, P, C>(
+    handle: DownloadHandle,
+    mut progress: tokio::sync::watch::Receiver<ProgressSnapshot>,
+    events: &mut ControlEvents,
+    renderer: &mut Renderer<W, P, C>,
+    model: &mut ProgressModel,
+    started: Instant,
+) -> TransferCycle
+where
+    W: Write,
+    P: TerminalProbe,
+    C: Clock,
+{
+    let mut events_open = true;
+    loop {
+        tokio::select! {
+            changed = progress.changed() => {
+                if changed.is_err() {
+                    return TransferCycle::Finished(handle.wait().await);
+                }
+                let snapshot = progress.borrow_and_update().clone();
+                apply_snapshot(model, &snapshot, started.elapsed());
+                if renderer.update(model, false).is_err() {
+                    handle.cancel();
+                    return TransferCycle::Finished(handle.wait().await);
+                }
+                if is_terminal(snapshot.state) {
+                    return TransferCycle::Finished(handle.wait().await);
+                }
+            }
+            request = events.receiver.recv(), if events_open => {
+                let Some(request) = request else {
+                    events_open = false;
+                    continue;
+                };
+
+                let snapshot = progress.borrow().clone();
+                apply_snapshot(model, &snapshot, started.elapsed());
+                if is_terminal(snapshot.state) {
+                    return TransferCycle::Finished(handle.wait().await);
+                }
+
+                match request {
+                    ControlRequest::Interrupt => {
+                        handle.cancel();
+                        return TransferCycle::Finished(handle.wait().await);
+                    }
+                    ControlRequest::Suspend => {
+                        handle.pause();
+                        let result = handle.wait().await;
+                        let snapshot = progress.borrow().clone();
+                        apply_snapshot(model, &snapshot, started.elapsed());
+                        return if matches!(result, Err(DownloadError::Paused)) {
+                            TransferCycle::Suspended
+                        } else {
+                            TransferCycle::Finished(result)
+                        };
+                    }
+                    ControlRequest::Continue | ControlRequest::Resize => {
+                        if renderer.update(model, true).is_err() {
+                            handle.cancel();
+                            return TransferCycle::Finished(handle.wait().await);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
