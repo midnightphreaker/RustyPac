@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "rust-crate-discovery": {
+      "source": "full-stack-skills/rust-skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust-crate-discovery/SKILL.md",
+      "computedHash": "253486343acb38453a60c0440e1831cec4558569b77ffe9adea17a8dac152d79"
+    }
+  }
+}

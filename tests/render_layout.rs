@@ -56,6 +56,10 @@ fn width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+fn ghostty_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text) + text.matches("⛓️‍💥").count() * 2
+}
+
 fn strip_ansi(text: &str) -> String {
     let mut result = String::new();
     let mut characters = text.chars().peekable();
@@ -129,6 +133,20 @@ fn formats_approved_skipped_rows_with_unavailable_fields() {
     ] {
         assert_eq!(format_row(&model, width(expected), false), expected);
     }
+}
+
+#[test]
+fn skipped_full_row_aligns_with_download_rows_in_ghostty() {
+    let terminal_width = width(FULL) + 40;
+    let completed = format_row(&completed_model(), terminal_width, false);
+    let skipped = format_row(&skipped_model(), terminal_width, false);
+
+    assert_eq!(
+        ghostty_width(&skipped),
+        ghostty_width(&completed),
+        "the broken-chain fallback glyphs must not push skipped fields right"
+    );
+    assert_eq!(ghostty_width(&skipped), terminal_width);
 }
 
 #[test]
