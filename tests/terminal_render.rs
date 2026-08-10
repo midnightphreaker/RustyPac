@@ -120,6 +120,11 @@ fn changed_frames_are_throttled_and_forced_frames_bypass_timing() {
     assert!(after_first.starts_with(b"\r"));
     assert!(after_first.ends_with(b"\x1b[K"));
     assert!(after_first.windows(9).any(|part| part == b"first.pkg"));
+    assert!(
+        width(strip_ansi(std::str::from_utf8(&after_first).unwrap()).trim_start_matches('\r'))
+            < width(FULL),
+        "an active frame must leave one terminal cell unused to avoid autowrap"
+    );
     assert_eq!(captured.flushes(), 1);
 
     clock.set(Duration::from_millis(999));
@@ -213,7 +218,7 @@ fn strip_ansi(text: &str) -> String {
 fn forced_resize_reprobes_width_and_redraws_immediately() {
     let writer = SharedWriter::default();
     let captured = writer.clone();
-    let probe = MutableProbe::new(TerminalInfo::terminal(width(FULL)));
+    let probe = MutableProbe::new(TerminalInfo::terminal(width(FULL) + 1));
     let mut renderer = Renderer::new(writer, probe.clone(), FakeClock::new());
     let model = active_model("very_long_filename_that_does_not_fit.zst");
 
@@ -225,7 +230,7 @@ fn forced_resize_reprobes_width_and_redraws_immediately() {
     );
     assert_eq!(probe.calls(), 1);
 
-    probe.set(TerminalInfo::terminal(width(SMALL)));
+    probe.set(TerminalInfo::terminal(width(SMALL) + 1));
     renderer.update(&model, true).unwrap();
     let all_frames = captured.bytes();
     let resized_frame = std::str::from_utf8(&all_frames[first_frame.len()..]).unwrap();
@@ -307,7 +312,7 @@ fn read_closed_pty(mut master: File) -> Vec<u8> {
 #[test]
 fn pty_uses_in_place_ansi_while_redirected_output_uses_flushed_records() {
     let clock = FakeClock::new();
-    let (master, slave) = open_pty(width(FULL) as u16);
+    let (master, slave) = open_pty((width(FULL) + 1) as u16);
     let probe_file = slave.try_clone().unwrap();
     let mut terminal_renderer = Renderer::new(
         slave,

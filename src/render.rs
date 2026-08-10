@@ -99,7 +99,7 @@ where
         }
 
         let terminal = self.terminal_probe.probe();
-        let row = format_row(model, terminal.width, terminal.is_terminal);
+        let row = format_row(model, usable_width(terminal), terminal.is_terminal);
         if self.last_row.as_deref() == Some(&row) {
             return Ok(());
         }
@@ -117,7 +117,7 @@ where
 
         let now = self.clock.now();
         let terminal = self.terminal_probe.probe();
-        let row = format_row(model, terminal.width, terminal.is_terminal);
+        let row = format_row(model, usable_width(terminal), terminal.is_terminal);
         self.write_row(&row, terminal.is_terminal, true)?;
         self.last_row = Some(row);
         self.last_draw = Some(now);
@@ -132,7 +132,7 @@ where
 
         let now = self.clock.now();
         let terminal = self.terminal_probe.probe();
-        let row = format_row(model, terminal.width, terminal.is_terminal);
+        let row = format_row(model, usable_width(terminal), terminal.is_terminal);
         self.write_row(&row, terminal.is_terminal, true)?;
         self.last_row = None;
         self.last_draw = Some(now);
@@ -151,6 +151,12 @@ where
         }
         self.writer.flush()
     }
+}
+
+fn usable_width(terminal: TerminalInfo) -> usize {
+    terminal
+        .width
+        .saturating_sub(usize::from(terminal.is_terminal))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
