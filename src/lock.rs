@@ -2,16 +2,26 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+type StaleRecoveryHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
+static STALE_RECOVERY_HOOK: Mutex<Option<StaleRecoveryHook>> = Mutex::new(None);
 
 #[derive(Debug)]
 pub struct OutputLock {
     path: PathBuf,
     owner: OwnerRecord,
     identity: FileIdentity,
-    _file: File,
+    file: File,
 }
 
 #[derive(Debug)]
@@ -42,12 +52,6 @@ struct FileIdentity {
     inode: u64,
 }
 
-#[derive(Debug)]
-struct LockSnapshot {
-    owner: OwnerRecord,
-    identity: FileIdentity,
-}
-
 impl OutputLock {
     pub fn acquire(output: &Path) -> Result<Self, LockError> {
         let path = lock_path(output);
@@ -55,27 +59,7 @@ impl OutputLock {
 
         match create_lock(&path, owner) {
             Ok(lock) => Ok(lock),
-            Err(CreateError::Exists) => {
-                let snapshot = read_snapshot(&path)?;
-                match process_start_time(snapshot.owner.pid, &path)? {
-                    Some(start_time) if start_time == snapshot.owner.start_time => {
-                        Err(LockError::Held {
-                            pid: snapshot.owner.pid,
-                        })
-                    }
-                    Some(_) | None => {
-                        remove_stale_if_unchanged(&path, &snapshot)?;
-                        match create_lock(&path, owner) {
-                            Ok(lock) => Ok(lock),
-                            Err(CreateError::Exists) => Err(LockError::Unverifiable {
-                                path,
-                                reason: "lock changed while recovering stale ownership".to_owned(),
-                            }),
-                            Err(CreateError::Io(error)) => Err(error),
-                        }
-                    }
-                }
-            }
+            Err(CreateError::Exists) => acquire_existing_lock(path, owner),
             Err(CreateError::Io(error)) => Err(error),
         }
     }
@@ -83,11 +67,10 @@ impl OutputLock {
 
 impl Drop for OutputLock {
     fn drop(&mut self) {
-        let Ok(snapshot) = read_snapshot(&self.path) else {
+        let Ok(owner) = read_owner_from_file(&mut self.file, &self.path) else {
             return;
         };
-
-        if snapshot.owner != self.owner || snapshot.identity != self.identity {
+        if owner != self.owner {
             return;
         }
 
@@ -135,7 +118,12 @@ enum CreateError {
 }
 
 fn create_lock(path: &Path, owner: OwnerRecord) -> Result<OutputLock, CreateError> {
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             return Err(CreateError::Exists);
@@ -149,12 +137,8 @@ fn create_lock(path: &Path, owner: OwnerRecord) -> Result<OutputLock, CreateErro
             .metadata()
             .map_err(|source| CreateError::Io(io_error("inspect", path, source)))?,
     );
-    let record = format!("{} {}\n", owner.pid, owner.start_time);
-
-    if let Err(source) = file
-        .write_all(record.as_bytes())
-        .and_then(|()| file.sync_data())
-    {
+    lock_exclusive(&file).map_err(|source| CreateError::Io(io_error("lock", path, source)))?;
+    if let Err(source) = write_owner(&mut file, owner) {
         remove_created_if_unchanged(path, identity);
         return Err(CreateError::Io(io_error("write", path, source)));
     }
@@ -163,26 +147,76 @@ fn create_lock(path: &Path, owner: OwnerRecord) -> Result<OutputLock, CreateErro
         path: path.to_owned(),
         owner,
         identity,
-        _file: file,
+        file,
     })
 }
 
-fn read_snapshot(path: &Path) -> Result<LockSnapshot, LockError> {
-    let mut file = File::open(path).map_err(|source| io_error("read", path, source))?;
+fn acquire_existing_lock(path: PathBuf, owner: OwnerRecord) -> Result<OutputLock, LockError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|source| io_error("open", &path, source))?;
     let identity = FileIdentity::from(
         &file
             .metadata()
-            .map_err(|source| io_error("inspect", path, source))?,
+            .map_err(|source| io_error("inspect", &path, source))?,
     );
+
+    let observed_owner = read_owner_from_file(&mut file, &path)?;
+    match process_start_time(observed_owner.pid, &path)? {
+        Some(start_time) if start_time == observed_owner.start_time => {
+            return Err(LockError::Held {
+                pid: observed_owner.pid,
+            });
+        }
+        Some(_) | None => run_stale_recovery_hook(&path),
+    }
+
+    if !try_lock_exclusive(&file).map_err(|source| io_error("lock", &path, source))? {
+        let pid = read_owner_from_file(&mut file, &path)?.pid;
+        return Err(LockError::Held { pid });
+    }
+
+    ensure_path_identity(&path, identity)?;
+    let locked_owner = read_owner_from_file(&mut file, &path)?;
+    match process_start_time(locked_owner.pid, &path)? {
+        Some(start_time) if start_time == locked_owner.start_time => {
+            return Err(LockError::Held {
+                pid: locked_owner.pid,
+            });
+        }
+        Some(_) | None => {}
+    }
+
+    write_owner(&mut file, owner).map_err(|source| io_error("write", &path, source))?;
+    ensure_path_identity(&path, identity)?;
+
+    Ok(OutputLock {
+        path,
+        owner,
+        identity,
+        file,
+    })
+}
+
+fn read_owner_from_file(file: &mut File, path: &Path) -> Result<OwnerRecord, LockError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| io_error("read", path, source))?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)
         .map_err(|source| io_error("read", path, source))?;
-    let owner = parse_owner_record(&contents).map_err(|reason| LockError::Unverifiable {
+    parse_owner_record(&contents).map_err(|reason| LockError::Unverifiable {
         path: path.to_owned(),
         reason,
-    })?;
+    })
+}
 
-    Ok(LockSnapshot { owner, identity })
+fn write_owner(file: &mut File, owner: OwnerRecord) -> io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    writeln!(file, "{} {}", owner.pid, owner.start_time)?;
+    file.sync_data()
 }
 
 fn parse_owner_record(contents: &str) -> Result<OwnerRecord, String> {
@@ -256,17 +290,71 @@ pub(crate) fn parse_proc_start_time(contents: &str) -> Result<u64, String> {
         .map_err(|_| "start-time field 22 is invalid".to_owned())
 }
 
-fn remove_stale_if_unchanged(path: &Path, expected: &LockSnapshot) -> Result<(), LockError> {
-    let current = read_snapshot(path)?;
-    if current.owner != expected.owner || current.identity != expected.identity {
+fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+    loop {
+        // SAFETY: `file` owns a valid descriptor for the duration of this call.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(true);
+        }
+
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+}
+
+fn lock_exclusive(file: &File) -> io::Result<()> {
+    loop {
+        // SAFETY: `file` owns a valid descriptor for the duration of this call.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result == 0 {
+            return Ok(());
+        }
+
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn ensure_path_identity(path: &Path, expected: FileIdentity) -> Result<(), LockError> {
+    let metadata = fs::metadata(path).map_err(|source| io_error("inspect", path, source))?;
+    if FileIdentity::from(&metadata) != expected {
         return Err(LockError::Unverifiable {
             path: path.to_owned(),
-            reason: "lock changed while verifying stale ownership".to_owned(),
+            reason: "lock path changed during acquisition".to_owned(),
         });
     }
-
-    fs::remove_file(path).map_err(|source| io_error("remove stale", path, source))
+    Ok(())
 }
+
+#[cfg(test)]
+pub(crate) fn set_stale_recovery_hook(hook: Option<StaleRecoveryHook>) {
+    *STALE_RECOVERY_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(test)]
+fn run_stale_recovery_hook(path: &Path) {
+    let hook = STALE_RECOVERY_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(not(test))]
+fn run_stale_recovery_hook(_path: &Path) {}
 
 fn remove_created_if_unchanged(path: &Path, identity: FileIdentity) {
     let Ok(metadata) = fs::metadata(path) else {

@@ -3,8 +3,10 @@ mod lock;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
-use lock::{parse_proc_start_time, LockError, OutputLock};
+use lock::{parse_proc_start_time, set_stale_recovery_hook, LockError, OutputLock};
 use tempfile::tempdir;
 
 fn lock_path(output: &Path) -> PathBuf {
@@ -87,6 +89,75 @@ fn reused_pid_with_a_different_start_time_is_recovered_as_stale() {
         format!("{} {}\n", std::process::id(), current_start_time())
     );
     drop(owner);
+    assert!(!path.exists());
+}
+
+#[derive(Default)]
+struct RecoveryGateState {
+    arrivals: usize,
+    release_second: bool,
+}
+
+#[test]
+fn concurrent_stale_recovery_has_one_protected_winner() {
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("package.part");
+    let path = lock_path(&output);
+    fs::write(&path, format!("{} 1\n", u32::MAX)).unwrap();
+
+    let gate = Arc::new((Mutex::new(RecoveryGateState::default()), Condvar::new()));
+    let hook_gate = Arc::clone(&gate);
+    let hook_path = path.clone();
+    set_stale_recovery_hook(Some(Arc::new(move |candidate| {
+        if candidate != hook_path {
+            return;
+        }
+
+        let (state, changed) = &*hook_gate;
+        let mut state = state.lock().unwrap();
+        state.arrivals += 1;
+        if state.arrivals == 1 {
+            changed.notify_all();
+            while state.arrivals < 2 {
+                state = changed.wait(state).unwrap();
+            }
+        } else {
+            changed.notify_all();
+            while !state.release_second {
+                state = changed.wait(state).unwrap();
+            }
+        }
+    })));
+
+    let mut recoverers = Vec::new();
+    for _ in 0..2 {
+        let output = output.clone();
+        let gate = Arc::clone(&gate);
+        recoverers.push(thread::spawn(move || {
+            let result = OutputLock::acquire(&output);
+            let (state, changed) = &*gate;
+            let mut state = state.lock().unwrap();
+            state.release_second = true;
+            changed.notify_all();
+            result
+        }));
+    }
+
+    let results: Vec<_> = recoverers
+        .into_iter()
+        .map(|recoverer| recoverer.join().unwrap())
+        .collect();
+    set_stale_recovery_hook(None);
+    let mut winners: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
+
+    assert_eq!(winners.len(), 1, "only one stale recoverer may own output");
+    assert!(matches!(
+        OutputLock::acquire(&output),
+        Err(LockError::Held { .. })
+    ));
+    assert!(path.exists(), "winner's lock record must remain linked");
+
+    drop(winners.pop());
     assert!(!path.exists());
 }
 
