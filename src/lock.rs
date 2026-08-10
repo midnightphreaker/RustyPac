@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -15,6 +15,9 @@ type StaleRecoveryHook = Arc<dyn Fn(&Path) + Send + Sync>;
 
 #[cfg(test)]
 static STALE_RECOVERY_HOOK: Mutex<Option<StaleRecoveryHook>> = Mutex::new(None);
+
+#[cfg(test)]
+static TAKEOVER_WRITE_FAILURE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 #[derive(Debug)]
 pub struct OutputLock {
@@ -152,16 +155,17 @@ fn create_lock(path: &Path, owner: OwnerRecord) -> Result<OutputLock, CreateErro
 }
 
 fn acquire_existing_lock(path: PathBuf, owner: OwnerRecord) -> Result<OutputLock, LockError> {
+    let path_identity = verified_path_identity(&path)?;
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
-        .map_err(|source| io_error("open", &path, source))?;
-    let identity = FileIdentity::from(
-        &file
-            .metadata()
-            .map_err(|source| io_error("inspect", &path, source))?,
-    );
+        .map_err(|source| open_existing_error(&path, source))?;
+    let identity = verified_file_identity(&file, &path)?;
+    if identity != path_identity {
+        return Err(lock_changed_error(&path));
+    }
 
     let observed_owner = read_owner_from_file(&mut file, &path)?;
     match process_start_time(observed_owner.pid, &path)? {
@@ -179,7 +183,7 @@ fn acquire_existing_lock(path: PathBuf, owner: OwnerRecord) -> Result<OutputLock
     }
 
     ensure_path_identity(&path, identity)?;
-    let locked_owner = read_owner_from_file(&mut file, &path)?;
+    let (prior_bytes, locked_owner) = read_record_from_file(&mut file, &path)?;
     match process_start_time(locked_owner.pid, &path)? {
         Some(start_time) if start_time == locked_owner.start_time => {
             return Err(LockError::Held {
@@ -189,7 +193,11 @@ fn acquire_existing_lock(path: PathBuf, owner: OwnerRecord) -> Result<OutputLock
         Some(_) | None => {}
     }
 
-    write_owner(&mut file, owner).map_err(|source| io_error("write", &path, source))?;
+    ensure_path_identity(&path, identity)?;
+    if let Err(source) = write_takeover_owner(&mut file, &path, owner) {
+        recover_failed_takeover(&mut file, &path, identity, &prior_bytes)?;
+        return Err(io_error("write", &path, source));
+    }
     ensure_path_identity(&path, identity)?;
 
     Ok(OutputLock {
@@ -201,22 +209,79 @@ fn acquire_existing_lock(path: PathBuf, owner: OwnerRecord) -> Result<OutputLock
 }
 
 fn read_owner_from_file(file: &mut File, path: &Path) -> Result<OwnerRecord, LockError> {
+    read_record_from_file(file, path).map(|(_, owner)| owner)
+}
+
+fn read_record_from_file(
+    file: &mut File,
+    path: &Path,
+) -> Result<(Vec<u8>, OwnerRecord), LockError> {
     file.seek(SeekFrom::Start(0))
         .map_err(|source| io_error("read", path, source))?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
         .map_err(|source| io_error("read", path, source))?;
-    parse_owner_record(&contents).map_err(|reason| LockError::Unverifiable {
+    let text = std::str::from_utf8(&contents).map_err(|_| LockError::Unverifiable {
+        path: path.to_owned(),
+        reason: "owner record is not valid UTF-8".to_owned(),
+    })?;
+    let owner = parse_owner_record(text).map_err(|reason| LockError::Unverifiable {
         path: path.to_owned(),
         reason,
-    })
+    })?;
+    Ok((contents, owner))
 }
 
 fn write_owner(file: &mut File, owner: OwnerRecord) -> io::Result<()> {
+    replace_contents(
+        file,
+        format!("{} {}\n", owner.pid, owner.start_time).as_bytes(),
+    )
+}
+
+fn write_takeover_owner(file: &mut File, path: &Path, owner: OwnerRecord) -> io::Result<()> {
+    #[cfg(test)]
+    if take_injected_write_failure(path) {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(b"partial")?;
+        return Err(io::Error::other("injected takeover write failure"));
+    }
+
+    write_owner(file, owner)
+}
+
+fn replace_contents(file: &mut File, contents: &[u8]) -> io::Result<()> {
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
-    writeln!(file, "{} {}", owner.pid, owner.start_time)?;
+    file.write_all(contents)?;
     file.sync_data()
+}
+
+fn recover_failed_takeover(
+    file: &mut File,
+    path: &Path,
+    identity: FileIdentity,
+    prior_bytes: &[u8],
+) -> Result<(), LockError> {
+    if replace_contents(file, prior_bytes).is_ok() {
+        return Ok(());
+    }
+
+    unlink_held_single_link(file, path, identity)
+}
+
+fn unlink_held_single_link(
+    file: &File,
+    path: &Path,
+    identity: FileIdentity,
+) -> Result<(), LockError> {
+    let file_identity = verified_file_identity(file, path)?;
+    let path_identity = verified_path_identity(path)?;
+    if file_identity != identity || path_identity != identity {
+        return Err(lock_changed_error(path));
+    }
+    fs::remove_file(path).map_err(|source| io_error("remove failed takeover", path, source))
 }
 
 fn parse_owner_record(contents: &str) -> Result<OwnerRecord, String> {
@@ -325,14 +390,60 @@ fn lock_exclusive(file: &File) -> io::Result<()> {
 }
 
 fn ensure_path_identity(path: &Path, expected: FileIdentity) -> Result<(), LockError> {
-    let metadata = fs::metadata(path).map_err(|source| io_error("inspect", path, source))?;
-    if FileIdentity::from(&metadata) != expected {
-        return Err(LockError::Unverifiable {
-            path: path.to_owned(),
-            reason: "lock path changed during acquisition".to_owned(),
-        });
+    if verified_path_identity(path)? != expected {
+        return Err(lock_changed_error(path));
     }
     Ok(())
+}
+
+fn verified_path_identity(path: &Path) -> Result<FileIdentity, LockError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| io_error("inspect", path, source))?;
+    verified_metadata_identity(&metadata, path)
+}
+
+fn verified_file_identity(file: &File, path: &Path) -> Result<FileIdentity, LockError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| io_error("inspect", path, source))?;
+    verified_metadata_identity(&metadata, path)
+}
+
+fn verified_metadata_identity(
+    metadata: &fs::Metadata,
+    path: &Path,
+) -> Result<FileIdentity, LockError> {
+    if !metadata.is_file() {
+        return Err(LockError::Unverifiable {
+            path: path.to_owned(),
+            reason: "lock is not a regular file".to_owned(),
+        });
+    }
+    if metadata.nlink() != 1 {
+        return Err(LockError::Unverifiable {
+            path: path.to_owned(),
+            reason: "lock has multiple hard links".to_owned(),
+        });
+    }
+    Ok(FileIdentity::from(metadata))
+}
+
+fn open_existing_error(path: &Path, source: io::Error) -> LockError {
+    if source.raw_os_error() == Some(libc::ELOOP) {
+        LockError::Unverifiable {
+            path: path.to_owned(),
+            reason: "lock is a symbolic link".to_owned(),
+        }
+    } else {
+        io_error("open", path, source)
+    }
+}
+
+fn lock_changed_error(path: &Path) -> LockError {
+    LockError::Unverifiable {
+        path: path.to_owned(),
+        reason: "lock path changed during acquisition".to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +451,26 @@ pub(crate) fn set_stale_recovery_hook(hook: Option<StaleRecoveryHook>) {
     *STALE_RECOVERY_HOOK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(test)]
+pub(crate) fn inject_takeover_write_failure(path: Option<PathBuf>) {
+    *TAKEOVER_WRITE_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+#[cfg(test)]
+fn take_injected_write_failure(path: &Path) -> bool {
+    let mut failure = TAKEOVER_WRITE_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if failure.as_deref() == Some(path) {
+        failure.take();
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]

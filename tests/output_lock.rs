@@ -2,11 +2,15 @@
 mod lock;
 
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use lock::{parse_proc_start_time, set_stale_recovery_hook, LockError, OutputLock};
+use lock::{
+    inject_takeover_write_failure, parse_proc_start_time, set_stale_recovery_hook, LockError,
+    OutputLock,
+};
 use tempfile::tempdir;
 
 fn lock_path(output: &Path) -> PathBuf {
@@ -89,6 +93,75 @@ fn reused_pid_with_a_different_start_time_is_recovered_as_stale() {
         format!("{} {}\n", std::process::id(), current_start_time())
     );
     drop(owner);
+    assert!(!path.exists());
+}
+
+#[test]
+fn symlink_lock_is_rejected_without_mutating_its_target() {
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("package.part");
+    let path = lock_path(&output);
+    let target = directory.path().join("symlink-target");
+    let original = format!("{} 1\n", u32::MAX);
+    fs::write(&target, &original).unwrap();
+    symlink(&target, &path).unwrap();
+
+    let result = OutputLock::acquire(&output);
+
+    assert!(matches!(result, Err(LockError::Unverifiable { .. })));
+    assert!(fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+}
+
+#[test]
+fn hard_link_lock_is_rejected_without_mutating_its_target() {
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("package.part");
+    let path = lock_path(&output);
+    let target = directory.path().join("hard-link-target");
+    let original = format!("{} 1\n", u32::MAX);
+    fs::write(&target, &original).unwrap();
+    fs::hard_link(&target, &path).unwrap();
+
+    let result = OutputLock::acquire(&output);
+
+    assert!(matches!(result, Err(LockError::Unverifiable { .. })));
+    assert_eq!(fs::read_to_string(&target).unwrap(), original);
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+}
+
+#[test]
+fn non_regular_lock_is_rejected_without_replacement() {
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("package.part");
+    let path = lock_path(&output);
+    fs::create_dir(&path).unwrap();
+
+    let result = OutputLock::acquire(&output);
+
+    assert!(matches!(result, Err(LockError::Unverifiable { .. })));
+    assert!(path.is_dir());
+}
+
+#[test]
+fn failed_stale_takeover_does_not_strand_an_invalid_owner_record() {
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("package.part");
+    let path = lock_path(&output);
+    let original = format!("{} 1\n", u32::MAX);
+    fs::write(&path, &original).unwrap();
+    inject_takeover_write_failure(Some(path.clone()));
+
+    let failed = OutputLock::acquire(&output);
+
+    inject_takeover_write_failure(None);
+    assert!(matches!(failed, Err(LockError::Io { .. })));
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    let recovered = OutputLock::acquire(&output).unwrap();
+    drop(recovered);
     assert!(!path.exists());
 }
 
