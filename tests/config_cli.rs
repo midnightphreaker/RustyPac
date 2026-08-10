@@ -9,13 +9,15 @@ use std::fs;
 use std::io::{self, BufRead, Cursor, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use config::{apply, plan_disable, plan_enable, ConfigState, DisableChoice};
 use config_interaction::RunStatus;
 use tempfile::tempdir;
 
 const ACTIVE: &str = "XferCommand = /usr/local/bin/RustyPac %u %o";
+const PLANNED: &[u8] = b"[options]\nColor\nXferCommand = /usr/local/bin/RustyPac %u %o\n";
+static CLEANUP_RACE_TEST: Mutex<()> = Mutex::new(());
 
 fn run_cli(path: &Path, argument: &str, input: &str) -> (RunStatus, Vec<u8>) {
     let mut input = Cursor::new(input.as_bytes());
@@ -207,6 +209,99 @@ fn apply_atomically_preserves_mode_owner_and_group() {
         fs::read(&path).unwrap(),
         b"[options]\nColor\nXferCommand = /usr/local/bin/RustyPac %u %o\n"
     );
+}
+
+#[test]
+fn removed_displaced_temp_does_not_remove_validated_installed_configuration() {
+    let _serial = CLEANUP_RACE_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("pacman.conf");
+    let original = b"[options]\nColor\n";
+    fs::write(&path, original).unwrap();
+    let plan = plan_enable(original, "/usr/local/bin/RustyPac").unwrap();
+    let expected_parent = directory.path().to_owned();
+    let observed = Arc::new(Mutex::new(None));
+    let hook_observed = Arc::clone(&observed);
+    config::set_apply_post_validation_hook(Some(Arc::new(move |temporary| {
+        if temporary.parent() == Some(expected_parent.as_path()) {
+            *hook_observed.lock().unwrap() = Some(temporary.to_owned());
+            fs::remove_file(temporary).unwrap();
+        }
+    })));
+
+    let result = apply(&path, plan);
+    config::set_apply_post_validation_hook(None);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(fs::read(&path).unwrap(), PLANNED);
+    let temporary = observed.lock().unwrap().clone().unwrap();
+    assert!(!temporary.exists());
+}
+
+#[test]
+fn replaced_displaced_temp_is_retained_without_rolling_back_validated_install() {
+    let _serial = CLEANUP_RACE_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("pacman.conf");
+    let original = b"[options]\nColor\n";
+    let foreign = b"foreign temporary bytes\n";
+    fs::write(&path, original).unwrap();
+    let plan = plan_enable(original, "/usr/local/bin/RustyPac").unwrap();
+    let expected_parent = directory.path().to_owned();
+    let observed = Arc::new(Mutex::new(None));
+    let hook_observed = Arc::clone(&observed);
+    config::set_apply_post_validation_hook(Some(Arc::new(move |temporary| {
+        if temporary.parent() == Some(expected_parent.as_path()) {
+            *hook_observed.lock().unwrap() = Some(temporary.to_owned());
+            let replacement = temporary.with_extension("foreign");
+            fs::write(&replacement, foreign).unwrap();
+            fs::rename(replacement, temporary).unwrap();
+        }
+    })));
+
+    let result = apply(&path, plan);
+    config::set_apply_post_validation_hook(None);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(fs::read(&path).unwrap(), PLANNED);
+    let temporary = observed.lock().unwrap().clone().unwrap();
+    assert_eq!(fs::read(temporary).unwrap(), foreign);
+}
+
+#[test]
+fn cleanup_boundary_replacement_is_not_unlinked_or_installed() {
+    let _serial = CLEANUP_RACE_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("pacman.conf");
+    let original = b"[options]\nColor\n";
+    let foreign = b"replacement at former check-unlink boundary\n";
+    fs::write(&path, original).unwrap();
+    let plan = plan_enable(original, "/usr/local/bin/RustyPac").unwrap();
+    let expected_parent = directory.path().to_owned();
+    let observed = Arc::new(Mutex::new(None));
+    let hook_observed = Arc::clone(&observed);
+    config::set_apply_cleanup_boundary_hook(Some(Arc::new(move |temporary| {
+        if temporary.parent() == Some(expected_parent.as_path()) {
+            *hook_observed.lock().unwrap() = Some(temporary.to_owned());
+            let replacement = temporary.with_extension("boundary");
+            fs::write(&replacement, foreign).unwrap();
+            fs::rename(replacement, temporary).unwrap();
+        }
+    })));
+
+    let result = apply(&path, plan);
+    config::set_apply_cleanup_boundary_hook(None);
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(fs::read(&path).unwrap(), PLANNED);
+    let temporary = observed.lock().unwrap().clone().unwrap();
+    assert_eq!(fs::read(temporary).unwrap(), foreign);
 }
 
 #[test]

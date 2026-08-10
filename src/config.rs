@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const PRESERVED_PREFIX: &[u8] = b"## Pre-RustyPac XferCommand ## ";
+const CLEANUP_GUARD_CONTENTS: &[u8] = b"RustyPac cleanup guard\n";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
@@ -20,6 +21,12 @@ type ApplyHook = Arc<dyn Fn(&Path) + Send + Sync>;
 
 #[cfg(test)]
 static APPLY_PRE_COMMIT_HOOK: Mutex<Option<ApplyHook>> = Mutex::new(None);
+
+#[cfg(test)]
+static APPLY_POST_VALIDATION_HOOK: Mutex<Option<ApplyHook>> = Mutex::new(None);
+
+#[cfg(test)]
+static APPLY_CLEANUP_BOUNDARY_HOOK: Mutex<Option<ApplyHook>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ConfigState {
@@ -118,6 +125,13 @@ struct Analysis {
 struct FileIdentity {
     device: u64,
     inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CleanupOutcome {
+    Removed,
+    AlreadyGone,
+    ForeignRetained,
 }
 
 pub fn plan_enable(contents: &[u8], executable: &str) -> Result<EditPlan, ConfigError> {
@@ -278,13 +292,11 @@ pub fn apply(path: &Path, plan: EditPlan) -> Result<(), ConfigError> {
             temporary_identity,
             &plan,
         ) {
-            rollback_exchange(path, &temporary_path, source_identity, temporary_identity)?;
+            rollback_exchange(path, &temporary_path, temporary_identity)?;
             return Err(error);
         }
-        if let Err(error) = remove_if_identity(&temporary_path, source_identity) {
-            rollback_exchange(path, &temporary_path, source_identity, temporary_identity)?;
-            return Err(error);
-        }
+        run_apply_post_validation_hook(&temporary_path);
+        let _cleanup = cleanup_displaced(path, &temporary_path, source_identity)?;
         File::open(parent)?.sync_all()?;
         Ok(())
     })();
@@ -345,32 +357,125 @@ fn validate_exchange(
 fn rollback_exchange(
     path: &Path,
     temporary_path: &Path,
-    source_identity: FileIdentity,
     temporary_identity: FileIdentity,
 ) -> Result<(), ConfigError> {
     if path_identity(path).ok() == Some(temporary_identity)
         && fs::symlink_metadata(temporary_path).is_ok()
     {
         exchange_paths(path, temporary_path)?;
-        remove_if_identity(temporary_path, temporary_identity)?;
+        cleanup_if_identity(temporary_path, temporary_identity);
         return Ok(());
     }
 
-    if path_identity(temporary_path).ok() == Some(source_identity) {
-        fs::remove_file(temporary_path)?;
-    }
-    if path_identity(path).ok() == Some(temporary_identity) {
-        fs::remove_file(path)?;
-    }
     Err(ConfigError::ChangedDuringEdit)
 }
 
-fn remove_if_identity(path: &Path, identity: FileIdentity) -> Result<(), ConfigError> {
-    if path_identity(path)? != identity {
+fn cleanup_displaced(
+    configured_path: &Path,
+    displaced_path: &Path,
+    displaced_identity: FileIdentity,
+) -> Result<CleanupOutcome, ConfigError> {
+    let (guard_path, mut guard, guard_identity) = open_cleanup_guard(configured_path)?;
+    run_apply_cleanup_boundary_hook(displaced_path);
+
+    if let Err(error) = exchange_paths(displaced_path, &guard_path) {
+        return if is_not_found(&error) {
+            Ok(CleanupOutcome::AlreadyGone)
+        } else {
+            Err(error)
+        };
+    }
+
+    if path_identity(&guard_path).ok() != Some(displaced_identity) {
+        if path_identity(displaced_path).ok() == Some(guard_identity)
+            && fs::symlink_metadata(&guard_path).is_ok()
+        {
+            exchange_paths(displaced_path, &guard_path)?;
+            if path_identity(&guard_path)? != guard_identity
+                || verified_file_identity(&guard, &guard_path)? != guard_identity
+                || read_descriptor(&mut guard)? != CLEANUP_GUARD_CONTENTS
+            {
+                return Err(ConfigError::ChangedDuringEdit);
+            }
+            return Ok(CleanupOutcome::ForeignRetained);
+        }
         return Err(ConfigError::ChangedDuringEdit);
     }
-    fs::remove_file(path)?;
-    Ok(())
+
+    if path_identity(displaced_path)? != guard_identity
+        || verified_file_identity(&guard, displaced_path)? != guard_identity
+    {
+        return Err(ConfigError::ChangedDuringEdit);
+    }
+    fs::rename(displaced_path, &guard_path)?;
+    if path_identity(&guard_path)? != guard_identity
+        || verified_file_identity(&guard, &guard_path)? != guard_identity
+        || read_descriptor(&mut guard)? != CLEANUP_GUARD_CONTENTS
+    {
+        return Err(ConfigError::ChangedDuringEdit);
+    }
+    Ok(CleanupOutcome::Removed)
+}
+
+fn open_cleanup_guard(path: &Path) -> Result<(PathBuf, File, FileIdentity), ConfigError> {
+    let parent = path.parent().ok_or_else(|| {
+        ConfigError::Invalid("configuration path has no parent directory".to_owned())
+    })?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| ConfigError::Invalid("configuration path has no filename".to_owned()))?;
+    let mut guard_name = OsString::from(".");
+    guard_name.push(filename);
+    guard_name.push(".rustypac-cleanup.guard");
+    let guard_path = parent.join(guard_name);
+    let mut created = false;
+    let mut guard = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&guard_path)
+    {
+        Ok(file) => {
+            created = true;
+            file
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&guard_path)
+            .map_err(ConfigError::Io)?,
+        Err(error) => return Err(ConfigError::Io(error)),
+    };
+    lock_exclusive(&guard)?;
+    let identity = verified_file_identity(&guard, &guard_path)?;
+    if verified_path_identity(&guard_path)? != identity {
+        return Err(ConfigError::ChangedDuringEdit);
+    }
+    if created {
+        guard.write_all(CLEANUP_GUARD_CONTENTS)?;
+        guard.sync_all()?;
+    } else if read_descriptor(&mut guard)? != CLEANUP_GUARD_CONTENTS {
+        return Err(ConfigError::Invalid(
+            "cleanup guard path is occupied by another file".to_owned(),
+        ));
+    }
+    Ok((guard_path, guard, identity))
+}
+
+fn lock_exclusive(file: &File) -> Result<(), ConfigError> {
+    loop {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(ConfigError::Io(error));
+        }
+    }
 }
 
 fn cleanup_if_identity(path: &Path, identity: FileIdentity) {
@@ -439,6 +544,10 @@ fn exchange_paths(first: &Path, second: &Path) -> Result<(), ConfigError> {
     }
 }
 
+fn is_not_found(error: &ConfigError) -> bool {
+    matches!(error, ConfigError::Io(source) if source.kind() == std::io::ErrorKind::NotFound)
+}
+
 impl From<&fs::Metadata> for FileIdentity {
     fn from(metadata: &fs::Metadata) -> Self {
         Self {
@@ -457,6 +566,22 @@ pub(crate) fn set_apply_pre_commit_hook(hook: Option<ApplyHook>) {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn set_apply_post_validation_hook(hook: Option<ApplyHook>) {
+    *APPLY_POST_VALIDATION_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn set_apply_cleanup_boundary_hook(hook: Option<ApplyHook>) {
+    *APPLY_CLEANUP_BOUNDARY_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(test)]
 fn run_apply_pre_commit_hook(path: &Path) {
     let hook = APPLY_PRE_COMMIT_HOOK
         .lock()
@@ -466,6 +591,34 @@ fn run_apply_pre_commit_hook(path: &Path) {
         hook(path);
     }
 }
+
+#[cfg(test)]
+fn run_apply_post_validation_hook(path: &Path) {
+    let hook = APPLY_POST_VALIDATION_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(not(test))]
+fn run_apply_post_validation_hook(_path: &Path) {}
+
+#[cfg(test)]
+fn run_apply_cleanup_boundary_hook(path: &Path) {
+    let hook = APPLY_CLEANUP_BOUNDARY_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(not(test))]
+fn run_apply_cleanup_boundary_hook(_path: &Path) {}
 
 #[cfg(not(test))]
 fn run_apply_pre_commit_hook(_path: &Path) {}
