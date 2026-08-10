@@ -39,7 +39,8 @@ pub fn run_enable<R: BufRead, W: Write>(path: &Path, input: &mut R, output: &mut
         Err(error) => return config_failure(output, "read response for", error, path),
     }
     match config::apply(path, plan) {
-        Ok(()) => {
+        Ok(outcome) => {
+            report_cleanup_warning(output, &outcome);
             let _ = writeln!(output, "RustyPac is now active");
             RunStatus::Success
         }
@@ -101,11 +102,22 @@ pub fn run_disable<R: BufRead, W: Write>(path: &Path, input: &mut R, output: &mu
         Err(error) => return config_failure(output, "inspect", error, path),
     };
     match config::apply(path, plan) {
-        Ok(()) => {
+        Ok(outcome) => {
+            report_cleanup_warning(output, &outcome);
             let _ = writeln!(output, "RustyPac is now disabled");
             RunStatus::Success
         }
         Err(error) => config_failure(output, "update", error, path),
+    }
+}
+
+fn report_cleanup_warning(output: &mut impl Write, outcome: &config::ApplyOutcome) {
+    if let config::ApplyOutcome::AppliedWithCleanupPending { staging_directory } = outcome {
+        let _ = writeln!(
+            output,
+            "RustyPac: configuration was updated, but cleanup remains at {}",
+            staging_directory.display()
+        );
     }
 }
 

@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const PRESERVED_PREFIX: &[u8] = b"## Pre-RustyPac XferCommand ## ";
-const CLEANUP_GUARD_CONTENTS: &[u8] = b"RustyPac cleanup guard\n";
+const EDIT_LOCK_CONTENTS: &[u8] = b"RustyPac edit lock v1\n";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
@@ -27,6 +27,13 @@ static APPLY_POST_VALIDATION_HOOK: Mutex<Option<ApplyHook>> = Mutex::new(None);
 
 #[cfg(test)]
 static APPLY_CLEANUP_BOUNDARY_HOOK: Mutex<Option<ApplyHook>> = Mutex::new(None);
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ApplyOutcome {
+    Unchanged,
+    Applied,
+    AppliedWithCleanupPending { staging_directory: PathBuf },
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ConfigState {
@@ -129,9 +136,14 @@ struct FileIdentity {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum CleanupOutcome {
-    Removed,
-    AlreadyGone,
-    ForeignRetained,
+    Complete,
+    Pending,
+}
+
+struct StagingDirectory {
+    path: PathBuf,
+    directory: File,
+    identity: FileIdentity,
 }
 
 pub fn plan_enable(contents: &[u8], executable: &str) -> Result<EditPlan, ConfigError> {
@@ -247,11 +259,12 @@ pub fn plan_disable(contents: &[u8], choice: DisableChoice) -> Result<EditPlan, 
     })
 }
 
-pub fn apply(path: &Path, plan: EditPlan) -> Result<(), ConfigError> {
+pub fn apply(path: &Path, plan: EditPlan) -> Result<ApplyOutcome, ConfigError> {
     if !plan.changed() {
-        return Ok(());
+        return Ok(ApplyOutcome::Unchanged);
     }
 
+    let _edit_lock = open_edit_lock(path)?;
     let (mut source, metadata, source_identity, current) = open_verified_source(path)?;
     if current != plan.original {
         return Err(ConfigError::ChangedDuringEdit);
@@ -259,10 +272,11 @@ pub fn apply(path: &Path, plan: EditPlan) -> Result<(), ConfigError> {
     let parent = path.parent().ok_or_else(|| {
         ConfigError::Invalid("configuration path has no parent directory".to_owned())
     })?;
-    let (temporary_path, mut temporary) = create_temporary(parent, path)?;
+    let staging = create_staging_directory(parent, path)?;
+    let (temporary_path, mut temporary) = create_temporary(&staging)?;
     let temporary_identity = verified_file_identity(&temporary, &temporary_path)?;
 
-    let staged = (|| -> Result<(), ConfigError> {
+    let staged = (|| -> Result<ApplyOutcome, ConfigError> {
         temporary.write_all(&plan.replacement)?;
         temporary.sync_all()?;
         preserve_metadata(&temporary, &metadata)?;
@@ -281,6 +295,7 @@ pub fn apply(path: &Path, plan: EditPlan) -> Result<(), ConfigError> {
                 "staged configuration did not have the planned state".to_owned(),
             ));
         }
+        staging.directory.sync_all()?;
         run_apply_pre_commit_hook(path);
         exchange_paths(path, &temporary_path)?;
         if let Err(error) = validate_exchange(
@@ -295,16 +310,106 @@ pub fn apply(path: &Path, plan: EditPlan) -> Result<(), ConfigError> {
             rollback_exchange(path, &temporary_path, temporary_identity)?;
             return Err(error);
         }
+        if File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .is_err()
+        {
+            return Ok(ApplyOutcome::AppliedWithCleanupPending {
+                staging_directory: staging.path.clone(),
+            });
+        }
         run_apply_post_validation_hook(&temporary_path);
-        let _cleanup = cleanup_displaced(path, &temporary_path, source_identity)?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        let cleanup = cleanup_displaced(&staging, &temporary_path, &source, source_identity);
+        if cleanup == CleanupOutcome::Complete {
+            let _ = File::open(parent).and_then(|directory| directory.sync_all());
+            Ok(ApplyOutcome::Applied)
+        } else {
+            Ok(ApplyOutcome::AppliedWithCleanupPending {
+                staging_directory: staging.path.clone(),
+            })
+        }
     })();
 
     if staged.is_err() {
         cleanup_if_identity(&temporary_path, temporary_identity);
+        cleanup_staging_directory(&staging);
     }
     staged
+}
+
+fn open_edit_lock(path: &Path) -> Result<File, ConfigError> {
+    let parent = path.parent().ok_or_else(|| {
+        ConfigError::Invalid("configuration path has no parent directory".to_owned())
+    })?;
+    let lock_path = edit_lock_path(path)?;
+    let mut created = false;
+    let mut lock = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
+    {
+        Ok(file) => {
+            created = true;
+            file
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(ConfigError::Io)?,
+        Err(error) => return Err(ConfigError::Io(error)),
+    };
+    lock_exclusive(&lock)?;
+    let identity = verified_file_identity(&lock, &lock_path)?;
+    if verified_path_identity(&lock_path)? != identity {
+        return Err(ConfigError::ChangedDuringEdit);
+    }
+    let metadata = lock.metadata()?;
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(ConfigError::Invalid(
+            "edit lock is not owned by the current user".to_owned(),
+        ));
+    }
+    if created {
+        lock.write_all(EDIT_LOCK_CONTENTS)?;
+        lock.sync_all()?;
+        File::open(parent)?.sync_all()?;
+    } else if read_descriptor(&mut lock)? != EDIT_LOCK_CONTENTS {
+        return Err(ConfigError::Invalid(
+            "edit lock path is occupied by another file".to_owned(),
+        ));
+    }
+    let result = unsafe { libc::fchmod(lock.as_raw_fd(), 0o600) };
+    if result != 0 {
+        return Err(ConfigError::Io(std::io::Error::last_os_error()));
+    }
+    let metadata = lock.metadata()?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != 0o600 {
+        return Err(ConfigError::Invalid(
+            "edit lock permissions are unsafe".to_owned(),
+        ));
+    }
+    if verified_path_identity(&lock_path)? != identity {
+        return Err(ConfigError::ChangedDuringEdit);
+    }
+    Ok(lock)
+}
+
+fn edit_lock_path(path: &Path) -> Result<PathBuf, ConfigError> {
+    let parent = path.parent().ok_or_else(|| {
+        ConfigError::Invalid("configuration path has no parent directory".to_owned())
+    })?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| ConfigError::Invalid("configuration path has no filename".to_owned()))?;
+    let mut name = OsString::from(".");
+    name.push(filename);
+    name.push(".rustypac-edit.lock");
+    Ok(parent.join(name))
 }
 
 fn open_verified_source(
@@ -371,98 +476,41 @@ fn rollback_exchange(
 }
 
 fn cleanup_displaced(
-    configured_path: &Path,
+    staging: &StagingDirectory,
     displaced_path: &Path,
+    displaced: &File,
     displaced_identity: FileIdentity,
-) -> Result<CleanupOutcome, ConfigError> {
-    let (guard_path, mut guard, guard_identity) = open_cleanup_guard(configured_path)?;
+) -> CleanupOutcome {
+    if verified_staging_directory(staging).is_err() {
+        return CleanupOutcome::Pending;
+    }
     run_apply_cleanup_boundary_hook(displaced_path);
-
-    if let Err(error) = exchange_paths(displaced_path, &guard_path) {
-        return if is_not_found(&error) {
-            Ok(CleanupOutcome::AlreadyGone)
-        } else {
-            Err(error)
-        };
-    }
-
-    if path_identity(&guard_path).ok() != Some(displaced_identity) {
-        if path_identity(displaced_path).ok() == Some(guard_identity)
-            && fs::symlink_metadata(&guard_path).is_ok()
-        {
-            exchange_paths(displaced_path, &guard_path)?;
-            if path_identity(&guard_path)? != guard_identity
-                || verified_file_identity(&guard, &guard_path)? != guard_identity
-                || read_descriptor(&mut guard)? != CLEANUP_GUARD_CONTENTS
-            {
-                return Err(ConfigError::ChangedDuringEdit);
-            }
-            return Ok(CleanupOutcome::ForeignRetained);
+    match path_identity(displaced_path) {
+        Err(ConfigError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            cleanup_staging_directory(staging);
+            return if staging.path.exists() {
+                CleanupOutcome::Pending
+            } else {
+                CleanupOutcome::Complete
+            };
         }
-        return Err(ConfigError::ChangedDuringEdit);
+        Ok(identity) if identity == displaced_identity => {}
+        _ => return CleanupOutcome::Pending,
     }
-
-    if path_identity(displaced_path)? != guard_identity
-        || verified_file_identity(&guard, displaced_path)? != guard_identity
-    {
-        return Err(ConfigError::ChangedDuringEdit);
+    if verified_file_identity(displaced, displaced_path).ok() != Some(displaced_identity) {
+        return CleanupOutcome::Pending;
     }
-    fs::rename(displaced_path, &guard_path)?;
-    if path_identity(&guard_path)? != guard_identity
-        || verified_file_identity(&guard, &guard_path)? != guard_identity
-        || read_descriptor(&mut guard)? != CLEANUP_GUARD_CONTENTS
-    {
-        return Err(ConfigError::ChangedDuringEdit);
+    let prepared = CString::new("prepared").expect("fixed staging filename has no NUL byte");
+    let result = unsafe { libc::unlinkat(staging.directory.as_raw_fd(), prepared.as_ptr(), 0) };
+    if result != 0 {
+        return CleanupOutcome::Pending;
     }
-    Ok(CleanupOutcome::Removed)
-}
-
-fn open_cleanup_guard(path: &Path) -> Result<(PathBuf, File, FileIdentity), ConfigError> {
-    let parent = path.parent().ok_or_else(|| {
-        ConfigError::Invalid("configuration path has no parent directory".to_owned())
-    })?;
-    let filename = path
-        .file_name()
-        .ok_or_else(|| ConfigError::Invalid("configuration path has no filename".to_owned()))?;
-    let mut guard_name = OsString::from(".");
-    guard_name.push(filename);
-    guard_name.push(".rustypac-cleanup.guard");
-    let guard_path = parent.join(guard_name);
-    let mut created = false;
-    let mut guard = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&guard_path)
-    {
-        Ok(file) => {
-            created = true;
-            file
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&guard_path)
-            .map_err(ConfigError::Io)?,
-        Err(error) => return Err(ConfigError::Io(error)),
-    };
-    lock_exclusive(&guard)?;
-    let identity = verified_file_identity(&guard, &guard_path)?;
-    if verified_path_identity(&guard_path)? != identity {
-        return Err(ConfigError::ChangedDuringEdit);
+    cleanup_staging_directory(staging);
+    if staging.path.exists() {
+        CleanupOutcome::Pending
+    } else {
+        CleanupOutcome::Complete
     }
-    if created {
-        guard.write_all(CLEANUP_GUARD_CONTENTS)?;
-        guard.sync_all()?;
-    } else if read_descriptor(&mut guard)? != CLEANUP_GUARD_CONTENTS {
-        return Err(ConfigError::Invalid(
-            "cleanup guard path is occupied by another file".to_owned(),
-        ));
-    }
-    Ok((guard_path, guard, identity))
 }
 
 fn lock_exclusive(file: &File) -> Result<(), ConfigError> {
@@ -542,10 +590,6 @@ fn exchange_paths(first: &Path, second: &Path) -> Result<(), ConfigError> {
     } else {
         Err(ConfigError::Io(std::io::Error::last_os_error()))
     }
-}
-
-fn is_not_found(error: &ConfigError) -> bool {
-    matches!(error, ConfigError::Io(source) if source.kind() == std::io::ErrorKind::NotFound)
 }
 
 impl From<&fs::Metadata> for FileIdentity {
@@ -857,7 +901,7 @@ fn apply_edits(contents: &[u8], mut edits: Vec<(usize, usize, Vec<u8>)>) -> Vec<
     output
 }
 
-fn create_temporary(parent: &Path, target: &Path) -> Result<(PathBuf, File), ConfigError> {
+fn create_staging_directory(parent: &Path, target: &Path) -> Result<StagingDirectory, ConfigError> {
     let name = target
         .file_name()
         .ok_or_else(|| ConfigError::Invalid("configuration path has no filename".to_owned()))?
@@ -865,25 +909,91 @@ fn create_temporary(parent: &Path, target: &Path) -> Result<(PathBuf, File), Con
     for _ in 0..100 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!(
-            ".{name}.rustypac-{}-{sequence}.tmp",
+            ".{name}.rustypac-stage-{}-{sequence}",
             std::process::id()
         ));
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        {
-            Ok(file) => return Ok((path, file)),
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&path) {
+            Ok(()) => {
+                let directory = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                    .open(&path)?;
+                let result = unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) };
+                if result != 0 {
+                    let error = ConfigError::Io(std::io::Error::last_os_error());
+                    let _ = fs::remove_dir(&path);
+                    return Err(error);
+                }
+                let metadata = directory.metadata()?;
+                if !metadata.is_dir()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.mode() & 0o7777 != 0o700
+                {
+                    let _ = fs::remove_dir(&path);
+                    return Err(ConfigError::Invalid(
+                        "private staging directory has unsafe ownership or permissions".to_owned(),
+                    ));
+                }
+                let identity = FileIdentity::from(&metadata);
+                if directory_path_identity(&path)? != identity {
+                    let _ = fs::remove_dir(&path);
+                    return Err(ConfigError::ChangedDuringEdit);
+                }
+                return Ok(StagingDirectory {
+                    path,
+                    directory,
+                    identity,
+                });
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(ConfigError::Io(error)),
         }
     }
     Err(ConfigError::Invalid(
-        "could not allocate a temporary configuration file".to_owned(),
+        "could not allocate a private staging directory".to_owned(),
     ))
+}
+
+fn create_temporary(staging: &StagingDirectory) -> Result<(PathBuf, File), ConfigError> {
+    verified_staging_directory(staging)?;
+    let path = staging.path.join("prepared");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    Ok((path, file))
+}
+
+fn verified_staging_directory(staging: &StagingDirectory) -> Result<(), ConfigError> {
+    let metadata = staging.directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o700
+        || FileIdentity::from(&metadata) != staging.identity
+        || directory_path_identity(&staging.path)? != staging.identity
+    {
+        return Err(ConfigError::ChangedDuringEdit);
+    }
+    Ok(())
+}
+
+fn directory_path_identity(path: &Path) -> Result<FileIdentity, ConfigError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(ConfigError::ChangedDuringEdit);
+    }
+    Ok(FileIdentity::from(&metadata))
+}
+
+fn cleanup_staging_directory(staging: &StagingDirectory) {
+    if verified_staging_directory(staging).is_ok() {
+        let _ = fs::remove_dir(&staging.path);
+    }
 }
 
 fn preserve_metadata(file: &File, metadata: &fs::Metadata) -> Result<(), ConfigError> {

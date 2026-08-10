@@ -5,19 +5,43 @@ mod config;
 #[path = "../src/config_interaction.rs"]
 mod config_interaction;
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, Cursor, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
-use config::{apply, plan_disable, plan_enable, ConfigState, DisableChoice};
+use config::{apply, plan_disable, plan_enable, ApplyOutcome, ConfigState, DisableChoice};
 use config_interaction::RunStatus;
 use tempfile::tempdir;
 
 const ACTIVE: &str = "XferCommand = /usr/local/bin/RustyPac %u %o";
 const PLANNED: &[u8] = b"[options]\nColor\nXferCommand = /usr/local/bin/RustyPac %u %o\n";
 static CLEANUP_RACE_TEST: Mutex<()> = Mutex::new(());
+
+fn edit_lock_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        ".{}.rustypac-edit.lock",
+        path.file_name().unwrap().to_string_lossy()
+    ))
+}
+
+fn staging_entries(parent: &Path) -> Vec<PathBuf> {
+    fs::read_dir(parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".rustypac-stage-")
+        })
+        .collect()
+}
 
 fn run_cli(path: &Path, argument: &str, input: &str) -> (RunStatus, Vec<u8>) {
     let mut input = Cursor::new(input.as_bytes());
@@ -212,6 +236,130 @@ fn apply_atomically_preserves_mode_owner_and_group() {
 }
 
 #[test]
+fn foreign_stable_edit_lock_is_rejected_before_configuration_mutation() {
+    let _serial = CLEANUP_RACE_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("pacman.conf");
+    let lock_path = edit_lock_path(&path);
+    let original = b"[options]\nColor\n";
+    fs::write(&path, original).unwrap();
+    fs::write(&lock_path, b"foreign lock contents\n").unwrap();
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let plan = plan_enable(original, "/usr/local/bin/RustyPac").unwrap();
+
+    let result = apply(&path, plan);
+
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(fs::read(&lock_path).unwrap(), b"foreign lock contents\n");
+    assert!(staging_entries(directory.path()).is_empty());
+}
+
+#[test]
+fn stable_edit_lock_serializes_overlapping_edits() {
+    let _serial = CLEANUP_RACE_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("pacman.conf");
+    let original = b"[options]\nColor\n";
+    fs::write(&path, original).unwrap();
+    let first_plan = plan_enable(original, "/usr/local/bin/RustyPac").unwrap();
+    let second_plan = plan_enable(original, "/usr/local/bin/RustyPac").unwrap();
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let release_for_hook = Arc::clone(&release_rx);
+    config::set_apply_pre_commit_hook(Some(Arc::new(move |_| {
+        let call = hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+        entered_tx.send(call).unwrap();
+        if call == 0 {
+            release_for_hook.lock().unwrap().recv().unwrap();
+        }
+    })));
+
+    let first_path = path.clone();
+    let first = thread::spawn(move || apply(&first_path, first_plan));
+    assert_eq!(entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+    let second_path = path.clone();
+    let second = thread::spawn(move || apply(&second_path, second_plan));
+    let overlap = entered_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+    release_tx.send(()).unwrap();
+    let first_result = first.join().unwrap();
+    let second_result = second.join().unwrap();
+    config::set_apply_pre_commit_hook(None);
+
+    assert!(
+        !overlap,
+        "a second edit reached commit while the first held the lock"
+    );
+    assert!(first_result.is_ok(), "{first_result:?}");
+    assert!(matches!(
+        second_result,
+        Err(config::ConfigError::ChangedDuringEdit)
+    ));
+    assert_eq!(fs::read(&path).unwrap(), PLANNED);
+}
+
+#[test]
+fn stable_edit_lock_mode_is_enforced() {
+    let _serial = CLEANUP_RACE_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("pacman.conf");
+    let lock_path = edit_lock_path(&path);
+    let original = b"[options]\nColor\n";
+    fs::write(&path, original).unwrap();
+    fs::write(&lock_path, b"RustyPac edit lock v1\n").unwrap();
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o666)).unwrap();
+    let plan = plan_enable(original, "/usr/local/bin/RustyPac").unwrap();
+
+    apply(&path, plan).unwrap();
+
+    assert!(
+        lock_path.exists(),
+        "the stable lock must remain at its fixed path"
+    );
+    let metadata = fs::metadata(lock_path).unwrap();
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+}
+
+#[test]
+fn successful_apply_leaves_no_private_staging_directory() {
+    let _serial = CLEANUP_RACE_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("pacman.conf");
+    let original = b"[options]\nColor\n";
+    fs::write(&path, original).unwrap();
+    let plan = plan_enable(original, "/usr/local/bin/RustyPac").unwrap();
+
+    apply(&path, plan).unwrap();
+
+    assert!(staging_entries(directory.path()).is_empty());
+    let mut entries: Vec<_> = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![
+            OsString::from(".pacman.conf.rustypac-edit.lock"),
+            OsString::from("pacman.conf")
+        ]
+    );
+    assert_eq!(fs::read(&path).unwrap(), PLANNED);
+}
+
+#[test]
 fn removed_displaced_temp_does_not_remove_validated_installed_configuration() {
     let _serial = CLEANUP_RACE_TEST
         .lock()
@@ -225,7 +373,7 @@ fn removed_displaced_temp_does_not_remove_validated_installed_configuration() {
     let observed = Arc::new(Mutex::new(None));
     let hook_observed = Arc::clone(&observed);
     config::set_apply_post_validation_hook(Some(Arc::new(move |temporary| {
-        if temporary.parent() == Some(expected_parent.as_path()) {
+        if temporary.parent().and_then(Path::parent) == Some(expected_parent.as_path()) {
             *hook_observed.lock().unwrap() = Some(temporary.to_owned());
             fs::remove_file(temporary).unwrap();
         }
@@ -234,7 +382,7 @@ fn removed_displaced_temp_does_not_remove_validated_installed_configuration() {
     let result = apply(&path, plan);
     config::set_apply_post_validation_hook(None);
 
-    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(result.unwrap(), ApplyOutcome::Applied);
     assert_eq!(fs::read(&path).unwrap(), PLANNED);
     let temporary = observed.lock().unwrap().clone().unwrap();
     assert!(!temporary.exists());
@@ -255,7 +403,7 @@ fn replaced_displaced_temp_is_retained_without_rolling_back_validated_install() 
     let observed = Arc::new(Mutex::new(None));
     let hook_observed = Arc::clone(&observed);
     config::set_apply_post_validation_hook(Some(Arc::new(move |temporary| {
-        if temporary.parent() == Some(expected_parent.as_path()) {
+        if temporary.parent().and_then(Path::parent) == Some(expected_parent.as_path()) {
             *hook_observed.lock().unwrap() = Some(temporary.to_owned());
             let replacement = temporary.with_extension("foreign");
             fs::write(&replacement, foreign).unwrap();
@@ -266,9 +414,14 @@ fn replaced_displaced_temp_is_retained_without_rolling_back_validated_install() 
     let result = apply(&path, plan);
     config::set_apply_post_validation_hook(None);
 
-    assert!(result.is_ok(), "{result:?}");
-    assert_eq!(fs::read(&path).unwrap(), PLANNED);
     let temporary = observed.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        result.unwrap(),
+        ApplyOutcome::AppliedWithCleanupPending {
+            staging_directory: temporary.parent().unwrap().to_owned()
+        }
+    );
+    assert_eq!(fs::read(&path).unwrap(), PLANNED);
     assert_eq!(fs::read(temporary).unwrap(), foreign);
 }
 
@@ -284,14 +437,11 @@ fn cleanup_boundary_replacement_is_not_unlinked_or_installed() {
     fs::write(&path, original).unwrap();
     let plan = plan_enable(original, "/usr/local/bin/RustyPac").unwrap();
     let expected_parent = directory.path().to_owned();
-    let observed = Arc::new(Mutex::new(None));
-    let hook_observed = Arc::clone(&observed);
+    let guard_path = path.with_file_name(".pacman.conf.rustypac-cleanup.guard");
+    let hooked_guard_path = guard_path.clone();
     config::set_apply_cleanup_boundary_hook(Some(Arc::new(move |temporary| {
-        if temporary.parent() == Some(expected_parent.as_path()) {
-            *hook_observed.lock().unwrap() = Some(temporary.to_owned());
-            let replacement = temporary.with_extension("boundary");
-            fs::write(&replacement, foreign).unwrap();
-            fs::rename(replacement, temporary).unwrap();
+        if temporary.parent().and_then(Path::parent) == Some(expected_parent.as_path()) {
+            fs::write(&hooked_guard_path, foreign).unwrap();
         }
     })));
 
@@ -300,12 +450,14 @@ fn cleanup_boundary_replacement_is_not_unlinked_or_installed() {
 
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(fs::read(&path).unwrap(), PLANNED);
-    let temporary = observed.lock().unwrap().clone().unwrap();
-    assert_eq!(fs::read(temporary).unwrap(), foreign);
+    assert_eq!(fs::read(guard_path).unwrap(), foreign);
 }
 
 #[test]
 fn changed_before_commit_returns_changed_without_losing_new_bytes() {
+    let _serial = CLEANUP_RACE_TEST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let directory = tempdir().unwrap();
     let path = directory.path().join("pacman.conf");
     let original = b"[options]\nColor\n";
@@ -329,7 +481,8 @@ fn changed_before_commit_returns_changed_without_losing_new_bytes() {
         Err(config::ConfigError::ChangedDuringEdit)
     ));
     assert_eq!(fs::read(&path).unwrap(), concurrent);
-    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    assert!(staging_entries(directory.path()).is_empty());
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
 }
 
 #[test]
