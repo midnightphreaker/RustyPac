@@ -17,6 +17,7 @@ use tempfile::tempdir;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RED: &[u8] = b"\x1b[31m";
+const PAUSE_GATE_ENV: &str = "RUSTYPAC_TEST_PAUSE_GATE";
 
 fn body(size: usize) -> Vec<u8> {
     (0..size).map(|index| (index % 251) as u8).collect()
@@ -133,14 +134,25 @@ struct ChildGuard {
 
 impl ChildGuard {
     fn spawn(url: &str, output: &Path, width: u16) -> Self {
+        Self::spawn_inner(url, output, width, None)
+    }
+
+    fn spawn_with_pause_gate(url: &str, output: &Path, width: u16, gate: &Path) -> Self {
+        Self::spawn_inner(url, output, width, Some(gate))
+    }
+
+    fn spawn_inner(url: &str, output: &Path, width: u16, gate: Option<&Path>) -> Self {
         let (master, slave) = open_pty(width);
-        let child = Command::new(env!("CARGO_BIN_EXE_RustyPac"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_RustyPac"));
+        command
             .arg(url)
             .arg(output)
             .stdout(Stdio::from(slave))
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn RustyPac child");
+            .stderr(Stdio::piped());
+        if let Some(gate) = gate {
+            command.env(PAUSE_GATE_ENV, gate);
+        }
+        let child = command.spawn().expect("spawn RustyPac child");
         Self {
             child: Some(child),
             master,
@@ -253,7 +265,7 @@ fn catchable_signals_checkpoint_finish_once_unlock_and_exit_nonzero() {
     for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         let expected = body(16 * 1024 * 1024 + 123);
         let server = HttpServer::spawn(
-            ServerConfig::new("/catchable", expected, ResponseMode::Ranges)
+            ServerConfig::new("/catchable", expected.clone(), ResponseMode::Ranges)
                 .throttled(8 * 1024, Duration::from_millis(4)),
         );
         let directory = tempdir().unwrap();
@@ -301,7 +313,165 @@ fn catchable_signals_checkpoint_finish_once_unlock_and_exit_nonzero() {
             1,
             "signal {signal} must finish exactly one interrupted terminal row"
         );
+
+        drop(server);
+        let recovery_server = HttpServer::spawn(ServerConfig::new(
+            "/catchable",
+            expected.clone(),
+            ResponseMode::Ranges,
+        ));
+        let recovered = ChildGuard::spawn(&recovery_server.url("/catchable"), &output, 160).wait();
+        assert!(recovered.status.success(), "stderr: {}", recovered.stderr);
+        assert_eq!(fs::read(&output).unwrap(), expected);
+        assert!(!sidecar_path(&output).exists());
+        assert!(!lock_path(&output).exists());
+        assert!(
+            recovery_server
+                .requests()
+                .iter()
+                .filter_map(range_start)
+                .any(|start| start > 0),
+            "signal {signal} checkpoint must resume from a nonzero range"
+        );
     }
+}
+
+fn wait_for_checkpoint_gate(child: &mut ChildGuard, gate: &Path) {
+    let ready = appended_path(gate, ".ready");
+    let pid = child.id();
+    wait_until(
+        || ready.exists() || process_is_stopped(pid) || !child.is_running(),
+        "checkpoint gate",
+        Duration::from_secs(5),
+    );
+    assert!(
+        ready.exists(),
+        "child stopped or exited before exposing the checkpoint control window"
+    );
+}
+
+fn release_checkpoint_after_queued_signal(gate: &Path, queued_suffix: &str) {
+    let queued = appended_path(gate, queued_suffix);
+    wait_until(
+        || queued.exists(),
+        "queued signal acknowledgement",
+        Duration::from_secs(2),
+    );
+    fs::write(appended_path(gate, ".release"), b"release").unwrap();
+}
+
+#[test]
+fn interrupt_queued_during_suspend_checkpoint_exits_without_sigstop() {
+    let expected = body(16 * 1024 * 1024 + 411);
+    let server = HttpServer::spawn(
+        ServerConfig::new("/checkpoint-interrupt", expected, ResponseMode::Ranges)
+            .throttled(8 * 1024, Duration::from_millis(4)),
+    );
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("checkpoint-interrupt.pkg.part");
+    let gate = directory.path().join("interrupt-gate");
+    let mut child = ChildGuard::spawn_with_pause_gate(
+        &server.url("/checkpoint-interrupt"),
+        &output,
+        160,
+        &gate,
+    );
+
+    wait_until(
+        || {
+            child.is_running()
+                && fs::metadata(&output).is_ok_and(|metadata| metadata.len() > 0)
+                && server.bytes_sent() > 2 * 1024 * 1024
+        },
+        "durable download progress",
+        Duration::from_secs(5),
+    );
+    send_signal(child.id(), libc::SIGTSTP);
+    wait_for_checkpoint_gate(&mut child, &gate);
+    send_signal(child.id(), libc::SIGINT);
+    release_checkpoint_after_queued_signal(&gate, ".interrupt.queued");
+
+    let pid = child.id();
+    wait_until(
+        || !child.is_running() || process_is_stopped(pid),
+        "post-checkpoint interrupt transition",
+        Duration::from_secs(5),
+    );
+    assert!(
+        !process_is_stopped(pid),
+        "queued interrupt was stranded behind SIGSTOP"
+    );
+    let result = child.wait();
+    assert_eq!(result.status.code(), Some(1), "stderr: {}", result.stderr);
+    assert!(has_valid_resume_state(&output));
+    assert!(!lock_path(&output).exists());
+    assert!(result.stdout.windows(RED.len()).any(|bytes| bytes == RED));
+    assert_eq!(
+        result.stdout.iter().filter(|&&byte| byte == b'\n').count(),
+        1,
+        "queued interrupt must finish only the interrupted row"
+    );
+}
+
+#[test]
+fn continue_queued_during_suspend_checkpoint_skips_sigstop_and_resumes() {
+    let expected = body(16 * 1024 * 1024 + 433);
+    let server = HttpServer::spawn(
+        ServerConfig::new(
+            "/checkpoint-continue",
+            expected.clone(),
+            ResponseMode::Ranges,
+        )
+        .throttled(8 * 1024, Duration::from_millis(4)),
+    );
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("checkpoint-continue.pkg.part");
+    let gate = directory.path().join("continue-gate");
+    let mut child =
+        ChildGuard::spawn_with_pause_gate(&server.url("/checkpoint-continue"), &output, 160, &gate);
+
+    wait_until(
+        || {
+            child.is_running()
+                && fs::metadata(&output).is_ok_and(|metadata| metadata.len() > 0)
+                && server.bytes_sent() > 2 * 1024 * 1024
+        },
+        "durable download progress",
+        Duration::from_secs(5),
+    );
+    let requests_before_pause = server.requests().len();
+    send_signal(child.id(), libc::SIGTSTP);
+    wait_for_checkpoint_gate(&mut child, &gate);
+    send_signal(child.id(), libc::SIGCONT);
+    release_checkpoint_after_queued_signal(&gate, ".continue.queued");
+
+    let pid = child.id();
+    wait_until(
+        || process_is_stopped(pid) || !child.is_running(),
+        "post-checkpoint stop or completion",
+        Duration::from_secs(5),
+    );
+    assert!(
+        !process_is_stopped(pid),
+        "pre-stop SIGCONT was consumed before an unconditional SIGSTOP"
+    );
+    let result = child.wait();
+    assert!(result.status.success(), "stderr: {}", result.stderr);
+    assert_eq!(fs::read(&output).unwrap(), expected);
+    assert!(!sidecar_path(&output).exists());
+    assert!(!lock_path(&output).exists());
+    assert_eq!(
+        result.stdout.iter().filter(|&&byte| byte == b'\n').count(),
+        1,
+        "skipped stop must not finalize a paused row"
+    );
+    assert!(
+        server.requests()[requests_before_pause..]
+            .iter()
+            .filter_map(range_start)
+            .any(|start| start > 0),
+        "pre-stop CONT must recreate a nonzero resumed transfer"
+    );
 }
 
 #[test]

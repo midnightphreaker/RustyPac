@@ -71,6 +71,7 @@ fn run_download(url: &str, output: &std::path::Path) -> ExitCode {
                     SignalEvent::Continue => control.continue_transfer(),
                     SignalEvent::Resize => control.resize(),
                 }
+                signals::record_test_delivery(event);
             }
         });
         let outcome = download::run(url, output, events, &mut renderer).await;

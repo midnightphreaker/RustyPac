@@ -44,3 +44,23 @@ impl SignalEvents {
         }
     }
 }
+
+#[cfg(debug_assertions)]
+pub(crate) fn record_test_delivery(event: SignalEvent) {
+    let Some(base) = std::env::var_os("RUSTYPAC_TEST_PAUSE_GATE") else {
+        return;
+    };
+    let mut path = base;
+    path.push(match event {
+        SignalEvent::Interrupt => ".interrupt.queued",
+        SignalEvent::Terminate => ".terminate.queued",
+        SignalEvent::Hangup => ".hangup.queued",
+        SignalEvent::Suspend => ".suspend.queued",
+        SignalEvent::Continue => ".continue.queued",
+        SignalEvent::Resize => ".resize.queued",
+    });
+    let _ = std::fs::write(std::path::PathBuf::from(path), b"queued");
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn record_test_delivery(_event: SignalEvent) {}

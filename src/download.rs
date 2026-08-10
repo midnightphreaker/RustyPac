@@ -84,7 +84,14 @@ impl ControlHandle {
 
 enum TransferCycle {
     Finished(Result<(), DownloadError>),
-    Suspended,
+    Suspended(PauseTransition),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PauseTransition {
+    Stop,
+    Resume,
+    Interrupt,
 }
 
 pub async fn run<W, P, C>(
@@ -153,7 +160,11 @@ where
 
         match cycle {
             TransferCycle::Finished(result) => break result,
-            TransferCycle::Suspended => {
+            TransferCycle::Suspended(PauseTransition::Interrupt) => {
+                break Err(DownloadError::Cancelled);
+            }
+            TransferCycle::Suspended(PauseTransition::Resume) => {}
+            TransferCycle::Suspended(PauseTransition::Stop) => {
                 model.state = DisplayState::Paused;
                 if renderer.suspend(&model).is_err() {
                     return finish(
@@ -164,8 +175,18 @@ where
                     );
                 }
 
-                // SAFETY: SIGSTOP is valid and has no user-defined handler. The call
-                // returns only after another process delivers SIGCONT.
+                match reconcile_paused_controls(&mut events, renderer, &model).await {
+                    Ok(PauseTransition::Interrupt) => break Err(DownloadError::Cancelled),
+                    Ok(PauseTransition::Resume) => continue,
+                    Ok(PauseTransition::Stop) => {}
+                    Err(error) => break Err(error),
+                }
+
+                // The queue was yielded to and drained after paused-row finalization.
+                // POSIX offers no atomic "drain controls and stop" operation, so a new
+                // control delivered after the final empty read can still race this last
+                // instruction. SIGSTOP itself is valid, uncatchable, and returns only
+                // after another process delivers SIGCONT.
                 if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
                     return finish(
                         renderer,
@@ -284,13 +305,19 @@ where
                     }
                     ControlRequest::Suspend => {
                         handle.pause();
+                        pause_checkpoint_test_gate().await;
                         let result = handle.wait().await;
                         let snapshot = progress.borrow().clone();
                         apply_snapshot(model, &snapshot, started.elapsed());
-                        return if matches!(result, Err(DownloadError::Paused)) {
-                            TransferCycle::Suspended
-                        } else {
-                            TransferCycle::Finished(result)
+                        return match result {
+                            Err(DownloadError::Paused) => {
+                                model.state = DisplayState::Paused;
+                                match reconcile_paused_controls(events, renderer, model).await {
+                                    Ok(transition) => TransferCycle::Suspended(transition),
+                                    Err(error) => TransferCycle::Finished(Err(error)),
+                                }
+                            }
+                            terminal_result => TransferCycle::Finished(terminal_result),
                         };
                     }
                     ControlRequest::Continue | ControlRequest::Resize => {
@@ -304,6 +331,59 @@ where
         }
     }
 }
+
+async fn reconcile_paused_controls<W, P, C>(
+    events: &mut ControlEvents,
+    renderer: &mut Renderer<W, P, C>,
+    model: &ProgressModel,
+) -> Result<PauseTransition, DownloadError>
+where
+    W: Write,
+    P: TerminalProbe,
+    C: Clock,
+{
+    tokio::task::yield_now().await;
+    let mut transition = PauseTransition::Stop;
+    while let Ok(request) = events.receiver.try_recv() {
+        match request {
+            ControlRequest::Interrupt => transition = PauseTransition::Interrupt,
+            ControlRequest::Suspend if transition != PauseTransition::Interrupt => {
+                transition = PauseTransition::Stop;
+            }
+            ControlRequest::Continue if transition != PauseTransition::Interrupt => {
+                transition = PauseTransition::Resume;
+            }
+            ControlRequest::Resize if transition != PauseTransition::Interrupt => {
+                renderer.update(model, true)?;
+            }
+            ControlRequest::Suspend | ControlRequest::Continue | ControlRequest::Resize => {}
+        }
+    }
+    Ok(transition)
+}
+
+#[cfg(debug_assertions)]
+async fn pause_checkpoint_test_gate() {
+    let Some(base) = std::env::var_os("RUSTYPAC_TEST_PAUSE_GATE") else {
+        return;
+    };
+    let mut ready = base.clone();
+    ready.push(".ready");
+    let ready = PathBuf::from(ready);
+    if fs::write(&ready, b"ready").is_err() {
+        return;
+    }
+    let mut release = base;
+    release.push(".release");
+    let release = PathBuf::from(release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !release.exists() && Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn pause_checkpoint_test_gate() {}
 
 fn initial_model(filename: String) -> ProgressModel {
     ProgressModel {
