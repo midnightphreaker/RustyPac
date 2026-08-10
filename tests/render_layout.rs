@@ -56,10 +56,6 @@ fn width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
-fn ghostty_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text) + text.matches("⛓️‍💥").count() * 2
-}
-
 fn strip_ansi(text: &str) -> String {
     let mut result = String::new();
     let mut characters = text.chars().peekable();
@@ -131,22 +127,45 @@ fn formats_approved_skipped_rows_with_unavailable_fields() {
         "⛓️‍💥 core.db.sig              ▐                       N/A   ▐       N/A           ▐     N/A      ▐  N/A",
         "⛓️‍💥 core.db.sig N/A",
     ] {
-        assert_eq!(format_row(&model, ghostty_width(expected), false), expected);
+        assert_eq!(format_row(&model, width(expected) + 7, false), expected);
     }
 }
 
 #[test]
-fn skipped_full_row_aligns_with_download_rows_in_ghostty() {
+fn skipped_full_row_uses_the_completed_row_boundary() {
     let terminal_width = width(FULL) + 40;
     let completed = format_row(&completed_model(), terminal_width, false);
     let skipped = format_row(&skipped_model(), terminal_width, false);
 
     assert_eq!(
-        ghostty_width(&skipped),
-        ghostty_width(&completed),
-        "the broken-chain fallback glyphs must not push skipped fields right"
+        width(skipped.split_once('▐').expect("skipped separator").0),
+        width(completed.split_once('▐').expect("completed separator").0),
     );
-    assert_eq!(ghostty_width(&skipped), terminal_width);
+    assert_eq!(width(&skipped), terminal_width - 7);
+}
+
+#[test]
+fn full_layout_keeps_success_skipped_and_error_boundaries_aligned() {
+    let terminal_width = width(FULL) + 40;
+    let mut error = active_model();
+    error.state = DisplayState::Error;
+    error.total = None;
+    error.bytes_per_second = None;
+    error.eta = None;
+
+    let rows = [
+        format_row(&completed_model(), terminal_width, false),
+        format_row(&skipped_model(), terminal_width, false),
+        format_row(&error, terminal_width, false),
+    ];
+    let separator_columns: Vec<_> = rows
+        .iter()
+        .map(|row| width(row.split_once('▐').expect("full row separator").0))
+        .collect();
+
+    assert_eq!(separator_columns, vec![separator_columns[0]; 3]);
+    assert_eq!(width(&rows[0]), terminal_width);
+    assert!(rows[1..].iter().all(|row| width(row) == terminal_width - 7));
 }
 
 #[test]
