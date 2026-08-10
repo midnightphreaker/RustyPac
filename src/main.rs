@@ -1,4 +1,6 @@
 mod cli;
+pub mod progress;
+pub mod render;
 
 use std::process::ExitCode;
 
