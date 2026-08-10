@@ -8,8 +8,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use lock::{
-    inject_takeover_write_failure, parse_proc_start_time, set_stale_recovery_hook, LockError,
-    OutputLock,
+    inject_post_transition_failure, inject_takeover_write_failure, parse_proc_start_time,
+    set_stale_recovery_hook, set_takeover_transition_hook, LockError, OutputLock,
 };
 use tempfile::tempdir;
 
@@ -160,6 +160,57 @@ fn failed_stale_takeover_does_not_strand_an_invalid_owner_record() {
     inject_takeover_write_failure(None);
     assert!(matches!(failed, Err(LockError::Io { .. })));
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    let recovered = OutputLock::acquire(&output).unwrap();
+    drop(recovered);
+    assert!(!path.exists());
+}
+
+#[test]
+fn hard_link_added_at_takeover_boundary_keeps_original_bytes_and_one_owner() {
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("package.part");
+    let path = lock_path(&output);
+    let alias = directory.path().join("late-hard-link");
+    let original = format!("{} 1\n", u32::MAX);
+    fs::write(&path, &original).unwrap();
+    let hook_alias = alias.clone();
+    let hook_path = path.clone();
+    set_takeover_transition_hook(Some(Arc::new(move |candidate| {
+        if candidate == hook_path {
+            fs::hard_link(candidate, &hook_alias).unwrap();
+        }
+    })));
+
+    let result = OutputLock::acquire(&output);
+
+    set_takeover_transition_hook(None);
+    let owner = result.unwrap();
+    assert_eq!(fs::read_to_string(&alias).unwrap(), original);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    assert!(matches!(
+        OutputLock::acquire(&output),
+        Err(LockError::Held { .. })
+    ));
+    drop(owner);
+    assert!(!path.exists());
+    assert_eq!(fs::read_to_string(&alias).unwrap(), original);
+}
+
+#[test]
+fn failed_post_transition_validation_does_not_strand_current_owner() {
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("package.part");
+    let path = lock_path(&output);
+    let original = format!("{} 1\n", u32::MAX);
+    fs::write(&path, &original).unwrap();
+    inject_post_transition_failure(Some(path.clone()));
+
+    let failed = OutputLock::acquire(&output);
+
+    inject_post_transition_failure(None);
+    assert!(matches!(failed, Err(LockError::Unverifiable { .. })));
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     let recovered = OutputLock::acquire(&output).unwrap();
     drop(recovered);
     assert!(!path.exists());

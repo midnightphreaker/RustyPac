@@ -1,11 +1,13 @@
 use std::error::Error;
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
@@ -18,6 +20,14 @@ static STALE_RECOVERY_HOOK: Mutex<Option<StaleRecoveryHook>> = Mutex::new(None);
 
 #[cfg(test)]
 static TAKEOVER_WRITE_FAILURE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+static TAKEOVER_TRANSITION_HOOK: Mutex<Option<StaleRecoveryHook>> = Mutex::new(None);
+
+#[cfg(test)]
+static POST_TRANSITION_FAILURE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub struct OutputLock {
@@ -53,6 +63,13 @@ struct OwnerRecord {
 struct FileIdentity {
     device: u64,
     inode: u64,
+}
+
+struct PreparedLock {
+    path: PathBuf,
+    owner: OwnerRecord,
+    identity: FileIdentity,
+    file: File,
 }
 
 impl OutputLock {
@@ -183,7 +200,7 @@ fn acquire_existing_lock(path: PathBuf, owner: OwnerRecord) -> Result<OutputLock
     }
 
     ensure_path_identity(&path, identity)?;
-    let (prior_bytes, locked_owner) = read_record_from_file(&mut file, &path)?;
+    let locked_owner = read_owner_from_file(&mut file, &path)?;
     match process_start_time(locked_owner.pid, &path)? {
         Some(start_time) if start_time == locked_owner.start_time => {
             return Err(LockError::Held {
@@ -194,18 +211,154 @@ fn acquire_existing_lock(path: PathBuf, owner: OwnerRecord) -> Result<OutputLock
     }
 
     ensure_path_identity(&path, identity)?;
-    if let Err(source) = write_takeover_owner(&mut file, &path, owner) {
-        recover_failed_takeover(&mut file, &path, identity, &prior_bytes)?;
-        return Err(io_error("write", &path, source));
+    let prepared = prepare_takeover(&path, owner)?;
+    run_takeover_transition_hook(&path);
+
+    if let Err(source) = exchange_paths(&path, &prepared.path) {
+        cleanup_prepared(&prepared.path, prepared.identity);
+        return Err(io_error("exchange", &path, source));
     }
-    ensure_path_identity(&path, identity)?;
+
+    if let Err(error) = validate_transition(&path, &prepared, &file, identity)
+        .and_then(|()| injected_post_transition_error(&path))
+        .and_then(|()| remove_displaced_stale(&prepared.path, identity))
+    {
+        return Err(rollback_transition(
+            &path,
+            &prepared.path,
+            prepared.identity,
+            error,
+        ));
+    }
 
     Ok(OutputLock {
         path,
+        owner: prepared.owner,
+        identity: prepared.identity,
+        file: prepared.file,
+    })
+}
+
+fn prepare_takeover(path: &Path, owner: OwnerRecord) -> Result<PreparedLock, LockError> {
+    let temp_path = next_temp_path(path);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|source| io_error("create takeover temporary", &temp_path, source))?;
+    let identity = FileIdentity::from(
+        &file
+            .metadata()
+            .map_err(|source| io_error("inspect", &temp_path, source))?,
+    );
+    if let Err(error) = verified_file_identity(&file, &temp_path) {
+        cleanup_prepared(&temp_path, identity);
+        return Err(error);
+    }
+    if let Err(source) = lock_exclusive(&file) {
+        cleanup_prepared(&temp_path, identity);
+        return Err(io_error("lock takeover temporary", &temp_path, source));
+    }
+    if let Err(source) = write_takeover_owner(&mut file, path, owner) {
+        cleanup_prepared(&temp_path, identity);
+        return Err(io_error("write takeover temporary", &temp_path, source));
+    }
+    if let Err(error) = ensure_path_identity(&temp_path, identity) {
+        cleanup_prepared(&temp_path, identity);
+        return Err(error);
+    }
+
+    Ok(PreparedLock {
+        path: temp_path,
         owner,
         identity,
         file,
     })
+}
+
+fn validate_transition(
+    lock_path: &Path,
+    prepared: &PreparedLock,
+    stale_file: &File,
+    stale_identity: FileIdentity,
+) -> Result<(), LockError> {
+    ensure_path_identity(lock_path, prepared.identity)?;
+    if regular_path_identity(&prepared.path)? != stale_identity
+        || regular_file_identity(stale_file, lock_path)? != stale_identity
+    {
+        return Err(lock_changed_error(lock_path));
+    }
+    Ok(())
+}
+
+fn remove_displaced_stale(path: &Path, expected: FileIdentity) -> Result<(), LockError> {
+    if regular_path_identity(path)? != expected {
+        return Err(lock_changed_error(path));
+    }
+    fs::remove_file(path).map_err(|source| io_error("remove displaced stale", path, source))
+}
+
+fn rollback_transition(
+    lock_path: &Path,
+    temp_path: &Path,
+    prepared_identity: FileIdentity,
+    original_error: LockError,
+) -> LockError {
+    if regular_path_identity(lock_path).ok() == Some(prepared_identity)
+        && fs::symlink_metadata(temp_path).is_ok()
+    {
+        if let Err(source) = exchange_paths(lock_path, temp_path) {
+            cleanup_prepared(lock_path, prepared_identity);
+            return io_error("roll back lock exchange", lock_path, source);
+        }
+        if regular_path_identity(temp_path).ok() == Some(prepared_identity) {
+            if let Err(source) = fs::remove_file(temp_path) {
+                return io_error("remove rolled-back temporary", temp_path, source);
+            }
+        }
+        return original_error;
+    }
+
+    cleanup_prepared(lock_path, prepared_identity);
+    cleanup_prepared(temp_path, prepared_identity);
+    original_error
+}
+
+fn cleanup_prepared(path: &Path, identity: FileIdentity) {
+    if verified_path_identity(path).ok() == Some(identity) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn exchange_paths(first: &Path, second: &Path) -> io::Result<()> {
+    let first = CString::new(first.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "lock path contains NUL"))?;
+    let second = CString::new(second.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "lock path contains NUL"))?;
+
+    // SAFETY: both C strings are NUL-terminated and remain alive for the syscall.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            first.as_ptr(),
+            libc::AT_FDCWD,
+            second.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn next_temp_path(lock_path: &Path) -> PathBuf {
+    let sequence = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let mut path = lock_path.as_os_str().to_os_string();
+    path.push(format!(".swap.{}.{sequence}", std::process::id()));
+    PathBuf::from(path)
 }
 
 fn read_owner_from_file(file: &mut File, path: &Path) -> Result<OwnerRecord, LockError> {
@@ -256,32 +409,6 @@ fn replace_contents(file: &mut File, contents: &[u8]) -> io::Result<()> {
     file.seek(SeekFrom::Start(0))?;
     file.write_all(contents)?;
     file.sync_data()
-}
-
-fn recover_failed_takeover(
-    file: &mut File,
-    path: &Path,
-    identity: FileIdentity,
-    prior_bytes: &[u8],
-) -> Result<(), LockError> {
-    if replace_contents(file, prior_bytes).is_ok() {
-        return Ok(());
-    }
-
-    unlink_held_single_link(file, path, identity)
-}
-
-fn unlink_held_single_link(
-    file: &File,
-    path: &Path,
-    identity: FileIdentity,
-) -> Result<(), LockError> {
-    let file_identity = verified_file_identity(file, path)?;
-    let path_identity = verified_path_identity(path)?;
-    if file_identity != identity || path_identity != identity {
-        return Err(lock_changed_error(path));
-    }
-    fs::remove_file(path).map_err(|source| io_error("remove failed takeover", path, source))
 }
 
 fn parse_owner_record(contents: &str) -> Result<OwnerRecord, String> {
@@ -409,6 +536,32 @@ fn verified_file_identity(file: &File, path: &Path) -> Result<FileIdentity, Lock
     verified_metadata_identity(&metadata, path)
 }
 
+fn regular_path_identity(path: &Path) -> Result<FileIdentity, LockError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| io_error("inspect", path, source))?;
+    regular_metadata_identity(&metadata, path)
+}
+
+fn regular_file_identity(file: &File, path: &Path) -> Result<FileIdentity, LockError> {
+    let metadata = file
+        .metadata()
+        .map_err(|source| io_error("inspect", path, source))?;
+    regular_metadata_identity(&metadata, path)
+}
+
+fn regular_metadata_identity(
+    metadata: &fs::Metadata,
+    path: &Path,
+) -> Result<FileIdentity, LockError> {
+    if !metadata.is_file() {
+        return Err(LockError::Unverifiable {
+            path: path.to_owned(),
+            reason: "lock is not a regular file".to_owned(),
+        });
+    }
+    Ok(FileIdentity::from(metadata))
+}
+
 fn verified_metadata_identity(
     metadata: &fs::Metadata,
     path: &Path,
@@ -461,6 +614,20 @@ pub(crate) fn inject_takeover_write_failure(path: Option<PathBuf>) {
 }
 
 #[cfg(test)]
+pub(crate) fn set_takeover_transition_hook(hook: Option<StaleRecoveryHook>) {
+    *TAKEOVER_TRANSITION_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(test)]
+pub(crate) fn inject_post_transition_failure(path: Option<PathBuf>) {
+    *POST_TRANSITION_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+#[cfg(test)]
 fn take_injected_write_failure(path: &Path) -> bool {
     let mut failure = TAKEOVER_WRITE_FAILURE
         .lock()
@@ -471,6 +638,41 @@ fn take_injected_write_failure(path: &Path) -> bool {
     } else {
         false
     }
+}
+
+#[cfg(test)]
+fn run_takeover_transition_hook(path: &Path) {
+    let hook = TAKEOVER_TRANSITION_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(not(test))]
+fn run_takeover_transition_hook(_path: &Path) {}
+
+#[cfg(test)]
+fn injected_post_transition_error(path: &Path) -> Result<(), LockError> {
+    let mut failure = POST_TRANSITION_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if failure.as_deref() == Some(path) {
+        failure.take();
+        Err(LockError::Unverifiable {
+            path: path.to_owned(),
+            reason: "injected post-transition validation failure".to_owned(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(test))]
+fn injected_post_transition_error(_path: &Path) -> Result<(), LockError> {
+    Ok(())
 }
 
 #[cfg(test)]
