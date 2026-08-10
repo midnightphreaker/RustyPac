@@ -1,13 +1,13 @@
 mod cli;
 pub mod config;
+mod config_interaction;
 pub mod download;
 mod lock;
 pub mod progress;
 pub mod render;
 pub mod signals;
 
-use std::io::{BufRead, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -19,8 +19,8 @@ use signals::SignalEvent;
 fn main() -> ExitCode {
     match cli::parse_args(std::env::args()) {
         Ok(Command::Download { url, output }) => run_download(&url, &output),
-        Ok(Command::Enable) => run_enable(&config_path()),
-        Ok(Command::Disable) => run_disable(&config_path()),
+        Ok(Command::Enable) => run_config_interaction(true),
+        Ok(Command::Disable) => run_config_interaction(false),
         Err(error) => {
             eprintln!("RustyPac: {error}");
             ExitCode::from(2)
@@ -28,127 +28,28 @@ fn main() -> ExitCode {
     }
 }
 
-const PACMAN_CONF: &str = "/etc/pacman.conf";
-const INSTALLED_EXECUTABLE: &str = "/usr/local/bin/RustyPac";
-
-fn config_path() -> PathBuf {
-    #[cfg(debug_assertions)]
-    if let Some(path) = std::env::var_os("RUSTYPAC_PACMAN_CONF") {
-        return PathBuf::from(path);
-    }
-    PathBuf::from(PACMAN_CONF)
-}
-
-fn run_enable(path: &Path) -> ExitCode {
-    let contents = match std::fs::read(path) {
-        Ok(contents) => contents,
-        Err(error) => return config_failure("read", error, path),
+fn run_config_interaction(enable: bool) -> ExitCode {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let stderr = std::io::stderr();
+    let mut output = stderr.lock();
+    let status = if enable {
+        config_interaction::run_enable(
+            config_interaction::production_config_path(),
+            &mut input,
+            &mut output,
+        )
+    } else {
+        config_interaction::run_disable(
+            config_interaction::production_config_path(),
+            &mut input,
+            &mut output,
+        )
     };
-    let plan = match config::plan_enable(&contents, INSTALLED_EXECUTABLE) {
-        Ok(plan) => plan,
-        Err(error) => return config_failure("inspect", error, path),
-    };
-    if plan.initial_state() == &config::ConfigState::Active {
-        eprintln!("RustyPac is already active");
-        return ExitCode::SUCCESS;
+    match status {
+        config_interaction::RunStatus::Success => ExitCode::SUCCESS,
+        config_interaction::RunStatus::Failure => ExitCode::from(1),
     }
-    note_sudo_requirement();
-    if !confirm("Enable RustyPac? [y/N]") {
-        eprintln!("RustyPac enable cancelled");
-        return ExitCode::SUCCESS;
-    }
-    match config::apply(path, plan) {
-        Ok(()) => {
-            eprintln!("RustyPac is now active");
-            ExitCode::SUCCESS
-        }
-        Err(error) => config_failure("update", error, path),
-    }
-}
-
-fn run_disable(path: &Path) -> ExitCode {
-    let contents = match std::fs::read(path) {
-        Ok(contents) => contents,
-        Err(error) => return config_failure("read", error, path),
-    };
-    let state = match config::state(&contents) {
-        Ok(state) => state,
-        Err(error) => return config_failure("inspect", error, path),
-    };
-    match state {
-        config::ConfigState::Absent => {
-            eprintln!("RustyPac is absent");
-            return ExitCode::SUCCESS;
-        }
-        config::ConfigState::Disabled => {
-            eprintln!("RustyPac is already disabled");
-            return ExitCode::SUCCESS;
-        }
-        config::ConfigState::Conflicting { line } => {
-            eprintln!("RustyPac is absent; another XferCommand is active: {line}");
-            return ExitCode::SUCCESS;
-        }
-        config::ConfigState::Active => {}
-    }
-    note_sudo_requirement();
-    if !confirm("Disable RustyPac? [y/N]") {
-        eprintln!("RustyPac disable cancelled");
-        return ExitCode::SUCCESS;
-    }
-    let choice = match config::has_preserved_downloader(&contents) {
-        Ok(true) => {
-            let answer = prompt(
-                "Revert to existing XferCommand [e] or to default pacman behaviour? [enter]",
-            );
-            if matches!(answer.as_deref(), Ok("e" | "E")) {
-                config::DisableChoice::Existing
-            } else {
-                config::DisableChoice::Default
-            }
-        }
-        Ok(false) => config::DisableChoice::Default,
-        Err(error) => return config_failure("inspect", error, path),
-    };
-    let plan = match config::plan_disable(&contents, choice) {
-        Ok(plan) => plan,
-        Err(error) => return config_failure("inspect", error, path),
-    };
-    match config::apply(path, plan) {
-        Ok(()) => {
-            eprintln!("RustyPac is now disabled");
-            ExitCode::SUCCESS
-        }
-        Err(error) => config_failure("update", error, path),
-    }
-}
-
-fn note_sudo_requirement() {
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("RustyPac: changing pacman.conf requires sudo");
-    }
-}
-
-fn confirm(question: &str) -> bool {
-    matches!(prompt(question).as_deref(), Ok("y" | "Y"))
-}
-
-fn prompt(question: &str) -> std::io::Result<String> {
-    eprint!("{question} ");
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-    while answer.ends_with(['\n', '\r']) {
-        answer.pop();
-    }
-    Ok(answer)
-}
-
-fn config_failure(action: &str, error: impl std::fmt::Display, path: &Path) -> ExitCode {
-    eprintln!("RustyPac: failed to {action} {}: {error}", path.display());
-    if unsafe { libc::geteuid() } != 0 {
-        eprintln!("RustyPac: rerun with sudo to modify pacman.conf");
-    }
-    ExitCode::from(1)
 }
 
 fn run_download(url: &str, output: &std::path::Path) -> ExitCode {

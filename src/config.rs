@@ -1,14 +1,25 @@
 use std::error::Error;
+use std::ffi::CString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
+
 const PRESERVED_PREFIX: &[u8] = b"## Pre-RustyPac XferCommand ## ";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+type ApplyHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
+static APPLY_PRE_COMMIT_HOOK: Mutex<Option<ApplyHook>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ConfigState {
@@ -103,6 +114,12 @@ struct Analysis {
     preserved: Option<Line>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
 pub fn plan_enable(contents: &[u8], executable: &str) -> Result<EditPlan, ConfigError> {
     let analysis = analyze(contents, executable)?;
     let initial_state = analysis.state.clone();
@@ -146,13 +163,14 @@ pub fn plan_enable(contents: &[u8], executable: &str) -> Result<EditPlan, Config
         inserted.extend_from_slice(newline);
         edits.push((conflicting.end, conflicting.end, inserted));
     } else {
+        let insertion_point = options_insertion_point(contents)?;
         let mut inserted = Vec::new();
-        if !contents.is_empty() && !contents.ends_with(b"\n") {
+        if insertion_point > 0 && contents[insertion_point - 1] != b'\n' {
             inserted.extend_from_slice(newline);
         }
         inserted.extend_from_slice(active.as_bytes());
         inserted.extend_from_slice(newline);
-        edits.push((contents.len(), contents.len(), inserted));
+        edits.push((insertion_point, insertion_point, inserted));
     }
 
     Ok(EditPlan {
@@ -187,8 +205,11 @@ pub fn plan_disable(contents: &[u8], choice: DisableChoice) -> Result<EditPlan, 
     let mut edits = vec![(rusty.start, rusty.content_end, commented)];
     let expected_state = if choice == DisableChoice::Existing {
         if let Some(preserved) = analysis.preserved {
-            let line = trim_ascii(preserved.content(contents));
-            let restored = line[PRESERVED_PREFIX.len()..].to_vec();
+            let restored = preserved_payload(preserved.content(contents))
+                .ok_or_else(|| {
+                    ConfigError::Invalid("preserved XferCommand marker is malformed".to_owned())
+                })?
+                .to_vec();
             let restored_text = String::from_utf8(restored.clone()).map_err(|_| {
                 ConfigError::Invalid("preserved XferCommand is not valid UTF-8".to_owned())
             })?;
@@ -217,15 +238,15 @@ pub fn apply(path: &Path, plan: EditPlan) -> Result<(), ConfigError> {
         return Ok(());
     }
 
-    let current = fs::read(path)?;
+    let (mut source, metadata, source_identity, current) = open_verified_source(path)?;
     if current != plan.original {
         return Err(ConfigError::ChangedDuringEdit);
     }
-    let metadata = fs::metadata(path)?;
     let parent = path.parent().ok_or_else(|| {
         ConfigError::Invalid("configuration path has no parent directory".to_owned())
     })?;
     let (temporary_path, mut temporary) = create_temporary(parent, path)?;
+    let temporary_identity = verified_file_identity(&temporary, &temporary_path)?;
 
     let staged = (|| -> Result<(), ConfigError> {
         temporary.write_all(&plan.replacement)?;
@@ -246,16 +267,208 @@ pub fn apply(path: &Path, plan: EditPlan) -> Result<(), ConfigError> {
                 "staged configuration did not have the planned state".to_owned(),
             ));
         }
-        fs::rename(&temporary_path, path)?;
+        run_apply_pre_commit_hook(path);
+        exchange_paths(path, &temporary_path)?;
+        if let Err(error) = validate_exchange(
+            path,
+            &temporary_path,
+            &mut source,
+            source_identity,
+            &mut temporary,
+            temporary_identity,
+            &plan,
+        ) {
+            rollback_exchange(path, &temporary_path, source_identity, temporary_identity)?;
+            return Err(error);
+        }
+        if let Err(error) = remove_if_identity(&temporary_path, source_identity) {
+            rollback_exchange(path, &temporary_path, source_identity, temporary_identity)?;
+            return Err(error);
+        }
         File::open(parent)?.sync_all()?;
         Ok(())
     })();
 
     if staged.is_err() {
-        let _ = fs::remove_file(&temporary_path);
+        cleanup_if_identity(&temporary_path, temporary_identity);
     }
     staged
 }
+
+fn open_verified_source(
+    path: &Path,
+) -> Result<(File, fs::Metadata, FileIdentity, Vec<u8>), ConfigError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                ConfigError::Invalid("configuration path is a symbolic link".to_owned())
+            } else {
+                ConfigError::Io(error)
+            }
+        })?;
+    let metadata = file.metadata()?;
+    let identity = verified_metadata_identity(&metadata)?;
+    if verified_path_identity(path)? != identity {
+        return Err(ConfigError::ChangedDuringEdit);
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    Ok((file, metadata, identity, contents))
+}
+
+fn validate_exchange(
+    path: &Path,
+    temporary_path: &Path,
+    source: &mut File,
+    source_identity: FileIdentity,
+    temporary: &mut File,
+    temporary_identity: FileIdentity,
+    plan: &EditPlan,
+) -> Result<(), ConfigError> {
+    if verified_path_identity(path)? != temporary_identity
+        || verified_path_identity(temporary_path)? != source_identity
+        || verified_file_identity(source, temporary_path)? != source_identity
+        || verified_file_identity(temporary, path)? != temporary_identity
+    {
+        return Err(ConfigError::ChangedDuringEdit);
+    }
+    if read_descriptor(source)? != plan.original || read_descriptor(temporary)? != plan.replacement
+    {
+        return Err(ConfigError::ChangedDuringEdit);
+    }
+    Ok(())
+}
+
+fn rollback_exchange(
+    path: &Path,
+    temporary_path: &Path,
+    source_identity: FileIdentity,
+    temporary_identity: FileIdentity,
+) -> Result<(), ConfigError> {
+    if path_identity(path).ok() == Some(temporary_identity)
+        && fs::symlink_metadata(temporary_path).is_ok()
+    {
+        exchange_paths(path, temporary_path)?;
+        remove_if_identity(temporary_path, temporary_identity)?;
+        return Ok(());
+    }
+
+    if path_identity(temporary_path).ok() == Some(source_identity) {
+        fs::remove_file(temporary_path)?;
+    }
+    if path_identity(path).ok() == Some(temporary_identity) {
+        fs::remove_file(path)?;
+    }
+    Err(ConfigError::ChangedDuringEdit)
+}
+
+fn remove_if_identity(path: &Path, identity: FileIdentity) -> Result<(), ConfigError> {
+    if path_identity(path)? != identity {
+        return Err(ConfigError::ChangedDuringEdit);
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn cleanup_if_identity(path: &Path, identity: FileIdentity) {
+    if path_identity(path).ok() == Some(identity) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn read_descriptor(file: &mut File) -> Result<Vec<u8>, ConfigError> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    Ok(contents)
+}
+
+fn verified_path_identity(path: &Path) -> Result<FileIdentity, ConfigError> {
+    let metadata = fs::symlink_metadata(path)?;
+    verified_metadata_identity(&metadata)
+}
+
+fn verified_file_identity(file: &File, _path: &Path) -> Result<FileIdentity, ConfigError> {
+    verified_metadata_identity(&file.metadata()?)
+}
+
+fn verified_metadata_identity(metadata: &fs::Metadata) -> Result<FileIdentity, ConfigError> {
+    if !metadata.is_file() {
+        return Err(ConfigError::Invalid(
+            "configuration path is not a regular file".to_owned(),
+        ));
+    }
+    if metadata.nlink() != 1 {
+        return Err(ConfigError::Invalid(
+            "configuration file has multiple hard links".to_owned(),
+        ));
+    }
+    Ok(FileIdentity::from(metadata))
+}
+
+fn path_identity(path: &Path) -> Result<FileIdentity, ConfigError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(ConfigError::ChangedDuringEdit);
+    }
+    Ok(FileIdentity::from(&metadata))
+}
+
+fn exchange_paths(first: &Path, second: &Path) -> Result<(), ConfigError> {
+    let first = CString::new(first.as_os_str().as_bytes())
+        .map_err(|_| ConfigError::Invalid("configuration path contains a NUL byte".to_owned()))?;
+    let second = CString::new(second.as_os_str().as_bytes()).map_err(|_| {
+        ConfigError::Invalid("temporary configuration path contains a NUL byte".to_owned())
+    })?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            first.as_ptr(),
+            libc::AT_FDCWD,
+            second.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(ConfigError::Io(std::io::Error::last_os_error()))
+    }
+}
+
+impl From<&fs::Metadata> for FileIdentity {
+    fn from(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn set_apply_pre_commit_hook(hook: Option<ApplyHook>) {
+    *APPLY_PRE_COMMIT_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(test)]
+fn run_apply_pre_commit_hook(path: &Path) {
+    let hook = APPLY_PRE_COMMIT_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(not(test))]
+fn run_apply_pre_commit_hook(_path: &Path) {}
 
 pub fn state(contents: &[u8]) -> Result<ConfigState, ConfigError> {
     Ok(analyze(contents, "/usr/local/bin/RustyPac")?.state)
@@ -277,14 +490,13 @@ fn analyze(contents: &[u8], executable: &str) -> Result<Analysis, ConfigError> {
     for line in lines(contents) {
         let raw = line.content(contents);
         let trimmed = trim_ascii(raw);
-        if trimmed.starts_with(PRESERVED_PREFIX) {
+        if let Some(original) = preserved_payload(raw) {
             if preserved.replace(line).is_some() {
                 return Err(ConfigError::Invalid(
                     "multiple preserved XferCommand lines".to_owned(),
                 ));
             }
-            let original = &trimmed[PRESERVED_PREFIX.len()..];
-            validate_xfer_command(original)?;
+            validate_xfer_command(trim_ascii(original))?;
             continue;
         }
 
@@ -416,6 +628,10 @@ fn strip_comment(line: &[u8]) -> Option<&[u8]> {
     Some(trim_ascii_start(remainder))
 }
 
+fn preserved_payload(line: &[u8]) -> Option<&[u8]> {
+    trim_ascii_start(line).strip_prefix(PRESERVED_PREFIX)
+}
+
 fn leading_indentation(line: &[u8]) -> &[u8] {
     let length = line
         .iter()
@@ -447,6 +663,31 @@ fn preferred_newline(contents: &[u8]) -> &'static [u8] {
     } else {
         b"\n"
     }
+}
+
+fn options_insertion_point(contents: &[u8]) -> Result<usize, ConfigError> {
+    let config_lines = lines(contents);
+    let options: Vec<usize> = config_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            (trim_ascii(line.content(contents)) == b"[options]").then_some(index)
+        })
+        .collect();
+    let [options_index] = options.as_slice() else {
+        return Err(ConfigError::Invalid(
+            "exactly one [options] section is required".to_owned(),
+        ));
+    };
+    Ok(config_lines
+        .iter()
+        .skip(options_index + 1)
+        .find(|line| is_section_header(trim_ascii(line.content(contents))))
+        .map_or(contents.len(), |line| line.start))
+}
+
+fn is_section_header(line: &[u8]) -> bool {
+    line.len() >= 2 && line.first() == Some(&b'[') && line.last() == Some(&b']')
 }
 
 fn apply_edits(contents: &[u8], mut edits: Vec<(usize, usize, Vec<u8>)>) -> Vec<u8> {
