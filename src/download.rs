@@ -33,11 +33,32 @@ pub struct ControlHandle {
 
 pub struct ControlEvents {
     receiver: watch::Receiver<ControlRequest>,
+    #[cfg(test)]
+    defer_interrupt_until_terminal: bool,
 }
 
 pub fn control_channel() -> (ControlHandle, ControlEvents) {
     let (sender, receiver) = watch::channel(ControlRequest::Running);
-    (ControlHandle { sender }, ControlEvents { receiver })
+    (
+        ControlHandle { sender },
+        ControlEvents {
+            receiver,
+            #[cfg(test)]
+            defer_interrupt_until_terminal: false,
+        },
+    )
+}
+
+#[cfg(test)]
+pub fn terminal_boundary_control_channel() -> (ControlHandle, ControlEvents) {
+    let (sender, receiver) = watch::channel(ControlRequest::Running);
+    (
+        ControlHandle { sender },
+        ControlEvents {
+            receiver,
+            defer_interrupt_until_terminal: true,
+        },
+    )
 }
 
 impl ControlHandle {
@@ -97,45 +118,53 @@ where
     }
 
     let mut events_open = true;
-    let mut interrupted = false;
-    let result = loop {
-        tokio::select! {
-            changed = progress.changed() => {
-                if changed.is_err() {
-                    break handle.wait().await;
-                }
-                let snapshot = progress.borrow_and_update().clone();
-                apply_snapshot(&mut model, &snapshot, started.elapsed());
-                if renderer.update(&model, false).is_err() {
-                    handle.cancel();
-                    break handle.wait().await;
-                }
-                if is_terminal(snapshot.state) {
-                    break handle.wait().await;
-                }
+    #[cfg(test)]
+    let defer_interrupt_until_terminal = events.defer_interrupt_until_terminal;
+    #[cfg(not(test))]
+    let defer_interrupt_until_terminal = false;
+    let result = if defer_interrupt_until_terminal {
+        let mut terminal_observer = progress.clone();
+        while !is_terminal(terminal_observer.borrow().state) {
+            if terminal_observer.changed().await.is_err() {
+                break;
             }
-            changed = events.receiver.changed(), if events_open => {
-                match changed {
-                    Ok(()) if *events.receiver.borrow_and_update() == ControlRequest::Interrupt => {
-                        interrupted = true;
+        }
+        if events.receiver.changed().await.is_ok()
+            && *events.receiver.borrow_and_update() == ControlRequest::Interrupt
+        {
+            handle.cancel();
+        }
+        handle.wait().await
+    } else {
+        loop {
+            tokio::select! {
+                changed = progress.changed() => {
+                    if changed.is_err() {
+                        break handle.wait().await;
+                    }
+                    let snapshot = progress.borrow_and_update().clone();
+                    apply_snapshot(&mut model, &snapshot, started.elapsed());
+                    if renderer.update(&model, false).is_err() {
                         handle.cancel();
                         break handle.wait().await;
                     }
-                    Ok(()) => {}
-                    Err(_) => events_open = false,
+                    if is_terminal(snapshot.state) {
+                        break handle.wait().await;
+                    }
+                }
+                changed = events.receiver.changed(), if events_open => {
+                    match changed {
+                        Ok(()) if *events.receiver.borrow_and_update() == ControlRequest::Interrupt => {
+                            handle.cancel();
+                            break handle.wait().await;
+                        }
+                        Ok(()) => {}
+                        Err(_) => events_open = false,
+                    }
                 }
             }
         }
     };
-
-    if interrupted {
-        return finish(
-            renderer,
-            &mut model,
-            DisplayState::Interrupted,
-            DownloadOutcome::Interrupted,
-        );
-    }
 
     match result {
         Ok(()) => match validate_and_clean(output) {
@@ -285,5 +314,9 @@ fn is_database_signature(url: &str, output: &Path) -> bool {
         .next()
         .unwrap_or(url);
     let url_filename = url_path.rsplit('/').next().unwrap_or_default();
-    url_filename.ends_with(".db.sig") || display_filename(output).ends_with(".db.sig")
+    let output_filename = output
+        .file_name()
+        .unwrap_or(output.as_os_str())
+        .to_string_lossy();
+    url_filename.ends_with(".db.sig") && output_filename.ends_with(".db.sig.part")
 }

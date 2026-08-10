@@ -12,6 +12,7 @@ mod progress;
 #[path = "../src/render.rs"]
 mod render;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -19,8 +20,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use download::{control_channel, run, DownloadOutcome};
-use http_server::{HttpServer, ResponseMode, ServerConfig};
+use download::{control_channel, run, terminal_boundary_control_channel, DownloadOutcome};
+use http_server::{HttpServer, RecordedRequest, ResponseMode, ServerConfig};
 use render::{Renderer, TerminalInfo};
 use tempfile::tempdir;
 
@@ -61,6 +62,20 @@ fn sidecar_path(output: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn observed_range_starts(server: &HttpServer) -> BTreeSet<u64> {
+    server.requests().iter().filter_map(range_start).collect()
+}
+
+fn range_start(request: &RecordedRequest) -> Option<u64> {
+    request
+        .header("range")?
+        .strip_prefix("bytes=")?
+        .split_once('-')?
+        .0
+        .parse::<u64>()
+        .ok()
+}
+
 async fn download_once(url: &str, output: &Path) -> (DownloadOutcome, String) {
     let writer = CapturedWriter::default();
     let capture = writer.clone();
@@ -70,9 +85,22 @@ async fn download_once(url: &str, output: &Path) -> (DownloadOutcome, String) {
     (outcome, capture.text())
 }
 
+async fn download_with_control_queued_at_terminal(
+    url: &str,
+    output: &Path,
+) -> (DownloadOutcome, String) {
+    let writer = CapturedWriter::default();
+    let capture = writer.clone();
+    let mut renderer = Renderer::new(writer, || TerminalInfo::terminal(160), || Duration::ZERO);
+    let (control, events) = terminal_boundary_control_channel();
+    control.interrupt();
+    let outcome = run(url, output, events, &mut renderer).await;
+    (outcome, capture.text())
+}
+
 #[tokio::test]
 async fn range_server_writes_exact_output_and_cleans_resume_state() {
-    let expected = body(512 * 1024);
+    let expected = body(11 * 1024 * 1024 + 123);
     let server = HttpServer::spawn(ServerConfig::new(
         "/package",
         expected.clone(),
@@ -86,10 +114,10 @@ async fn range_server_writes_exact_output_and_cleans_resume_state() {
     assert_eq!(outcome, DownloadOutcome::Completed);
     assert_eq!(fs::read(&output).unwrap(), expected);
     assert!(!sidecar_path(&output).exists());
-    assert!(server
-        .requests()
-        .iter()
-        .any(|request| request.header("range").is_some()));
+    let range_starts = observed_range_starts(&server);
+    assert!(range_starts.contains(&0));
+    assert!(range_starts.iter().any(|start| *start > 0));
+    assert!(range_starts.len() > 1);
     assert!(rendered.contains(GREEN), "completion must render green");
 }
 
@@ -133,7 +161,7 @@ async fn ordinary_404_is_a_red_failure() {
 }
 
 #[tokio::test]
-async fn database_signature_404_and_410_are_dark_gray_skips() {
+async fn paired_database_signature_request_and_part_output_are_dark_gray_skips() {
     for status in [404, 410] {
         let server = HttpServer::spawn(ServerConfig::new(
             "/repo.db.sig",
@@ -148,6 +176,33 @@ async fn database_signature_404_and_410_are_dark_gray_skips() {
         assert_eq!(outcome, DownloadOutcome::SkippedDatabaseSignature);
         assert!(rendered.contains(DARK_GRAY), "skip must render dark gray");
         assert!(rendered.contains("⛓️‍💥"));
+    }
+}
+
+#[tokio::test]
+async fn database_signature_skip_requires_matching_request_and_part_output() {
+    for (request_path, output_name) in [
+        ("/ordinary.db", "repo.db.sig.part"),
+        ("/repo.db.sig", "ordinary.db.part"),
+        ("/repo.db.sig", "repo.db.sig"),
+    ] {
+        let server = HttpServer::spawn(ServerConfig::new(
+            request_path,
+            Vec::new(),
+            ResponseMode::Status(404),
+        ));
+        let directory = tempdir().unwrap();
+        let output = directory.path().join(output_name);
+
+        let (outcome, rendered) = download_once(&server.url(request_path), &output).await;
+
+        assert_eq!(
+            outcome,
+            DownloadOutcome::Failed,
+            "{request_path} -> {output_name} must hard-fail"
+        );
+        assert!(rendered.contains(RED));
+        assert!(!rendered.contains(DARK_GRAY));
     }
 }
 
@@ -209,6 +264,43 @@ async fn empty_success_response_is_rejected() {
     assert!(rendered.contains(RED));
 }
 
+#[tokio::test]
+async fn queued_control_at_success_boundary_preserves_completed_outcome() {
+    let expected = body(64 * 1024);
+    let server = HttpServer::spawn(ServerConfig::new(
+        "/terminal-success",
+        expected.clone(),
+        ResponseMode::Ranges,
+    ));
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("terminal-success.part");
+
+    let (outcome, rendered) =
+        download_with_control_queued_at_terminal(&server.url("/terminal-success"), &output).await;
+
+    assert_eq!(outcome, DownloadOutcome::Completed);
+    assert_eq!(fs::read(&output).unwrap(), expected);
+    assert!(!sidecar_path(&output).exists());
+    assert!(rendered.contains(GREEN));
+}
+
+#[tokio::test]
+async fn queued_control_at_error_boundary_preserves_hard_failure() {
+    let server = HttpServer::spawn(ServerConfig::new(
+        "/terminal-error",
+        Vec::new(),
+        ResponseMode::Status(404),
+    ));
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("terminal-error.part");
+
+    let (outcome, rendered) =
+        download_with_control_queued_at_terminal(&server.url("/terminal-error"), &output).await;
+
+    assert_eq!(outcome, DownloadOutcome::Failed);
+    assert!(rendered.contains(RED));
+}
+
 async fn interrupt_then_complete(use_alternate_url: bool) {
     let expected = body(768 * 1024);
     let slow_server = HttpServer::spawn(
@@ -250,6 +342,7 @@ async fn interrupt_then_complete(use_alternate_url: bool) {
         "resume sidecar must contain a payload"
     );
     assert_eq!(&control_bytes[..4], &0x4259_4845u32.to_le_bytes());
+    let requests_before_restart = slow_server.requests().len();
 
     let alternate_server;
     let completion_url = if use_alternate_url {
@@ -267,6 +360,16 @@ async fn interrupt_then_complete(use_alternate_url: bool) {
     assert_eq!(outcome, DownloadOutcome::Completed);
     assert_eq!(fs::read(&output).unwrap(), expected);
     assert!(!sidecar.exists());
+    if !use_alternate_url {
+        let requests = slow_server.requests();
+        assert!(
+            requests[requests_before_restart..]
+                .iter()
+                .filter_map(range_start)
+                .any(|start| start > 0),
+            "same-URL restart must request a nonzero resume offset"
+        );
+    }
 }
 
 #[tokio::test]
