@@ -274,7 +274,11 @@ fn stable_edit_lock_serializes_overlapping_edits() {
     let release_rx = Arc::new(Mutex::new(release_rx));
     let hook_calls_for_hook = Arc::clone(&hook_calls);
     let release_for_hook = Arc::clone(&release_rx);
-    config::set_apply_pre_commit_hook(Some(Arc::new(move |_| {
+    let hook_path = path.clone();
+    config::set_apply_pre_commit_hook(Some(Arc::new(move |candidate| {
+        if candidate != hook_path {
+            return;
+        }
         let call = hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
         entered_tx.send(call).unwrap();
         if call == 0 {
@@ -285,6 +289,14 @@ fn stable_edit_lock_serializes_overlapping_edits() {
     let first_path = path.clone();
     let first = thread::spawn(move || apply(&first_path, first_plan));
     assert_eq!(entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+
+    let unrelated_path = directory.path().join("unrelated.conf");
+    fs::write(&unrelated_path, original).unwrap();
+    let unrelated_plan = plan_enable(original, "/usr/local/bin/RustyPac").unwrap();
+    let unrelated = thread::spawn(move || apply(&unrelated_path, unrelated_plan));
+    let unrelated_result = unrelated.join().unwrap();
+    let unrelated_observed = entered_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+
     let second_path = path.clone();
     let second = thread::spawn(move || apply(&second_path, second_plan));
     let overlap = entered_rx.recv_timeout(Duration::from_millis(250)).is_ok();
@@ -293,6 +305,11 @@ fn stable_edit_lock_serializes_overlapping_edits() {
     let second_result = second.join().unwrap();
     config::set_apply_pre_commit_hook(None);
 
+    assert!(unrelated_result.is_ok(), "{unrelated_result:?}");
+    assert!(
+        !unrelated_observed,
+        "the target-scoped hook observed an unrelated concurrent apply"
+    );
     assert!(
         !overlap,
         "a second edit reached commit while the first held the lock"
