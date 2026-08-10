@@ -392,9 +392,9 @@ fn write_owner(file: &mut File, owner: OwnerRecord) -> io::Result<()> {
     )
 }
 
-fn write_takeover_owner(file: &mut File, path: &Path, owner: OwnerRecord) -> io::Result<()> {
+fn write_takeover_owner(file: &mut File, _path: &Path, owner: OwnerRecord) -> io::Result<()> {
     #[cfg(test)]
-    if take_injected_write_failure(path) {
+    if take_injected_write_failure(_path) {
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(b"partial")?;
@@ -600,6 +600,7 @@ fn lock_changed_error(path: &Path) -> LockError {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn set_stale_recovery_hook(hook: Option<StaleRecoveryHook>) {
     *STALE_RECOVERY_HOOK
         .lock()
@@ -607,6 +608,7 @@ pub(crate) fn set_stale_recovery_hook(hook: Option<StaleRecoveryHook>) {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn inject_takeover_write_failure(path: Option<PathBuf>) {
     *TAKEOVER_WRITE_FAILURE
         .lock()
@@ -614,6 +616,7 @@ pub(crate) fn inject_takeover_write_failure(path: Option<PathBuf>) {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn set_takeover_transition_hook(hook: Option<StaleRecoveryHook>) {
     *TAKEOVER_TRANSITION_HOOK
         .lock()
@@ -621,6 +624,7 @@ pub(crate) fn set_takeover_transition_hook(hook: Option<StaleRecoveryHook>) {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn inject_post_transition_failure(path: Option<PathBuf>) {
     *POST_TRANSITION_FAILURE
         .lock()
