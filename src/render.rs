@@ -1,3 +1,6 @@
+use std::io::{self, Write};
+use std::time::Duration;
+
 use unicode_width::UnicodeWidthStr;
 
 use crate::progress::{DisplayState, ProgressModel};
@@ -5,6 +8,136 @@ use crate::progress::{DisplayState, ProgressModel};
 const MIN_FILENAME_WIDTH: usize = 23;
 const RESET: &str = "\x1b[0m";
 const PURPLE: &str = "\x1b[35m";
+const DRAW_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalInfo {
+    pub is_terminal: bool,
+    pub width: usize,
+}
+
+impl TerminalInfo {
+    pub const fn terminal(width: usize) -> Self {
+        Self {
+            is_terminal: true,
+            width,
+        }
+    }
+
+    pub const fn redirected(width: usize) -> Self {
+        Self {
+            is_terminal: false,
+            width,
+        }
+    }
+}
+
+pub trait TerminalProbe {
+    fn probe(&self) -> TerminalInfo;
+}
+
+impl<F> TerminalProbe for F
+where
+    F: Fn() -> TerminalInfo,
+{
+    fn probe(&self) -> TerminalInfo {
+        self()
+    }
+}
+
+pub trait Clock {
+    fn now(&self) -> Duration;
+}
+
+impl<F> Clock for F
+where
+    F: Fn() -> Duration,
+{
+    fn now(&self) -> Duration {
+        self()
+    }
+}
+
+pub struct Renderer<W, P, C> {
+    writer: W,
+    terminal_probe: P,
+    clock: C,
+    last_row: Option<String>,
+    last_draw: Option<Duration>,
+    finished: bool,
+}
+
+impl<W, P, C> Renderer<W, P, C>
+where
+    W: Write,
+    P: TerminalProbe,
+    C: Clock,
+{
+    pub fn new(writer: W, terminal_probe: P, clock: C) -> Self {
+        Self {
+            writer,
+            terminal_probe,
+            clock,
+            last_row: None,
+            last_draw: None,
+            finished: false,
+        }
+    }
+
+    pub fn update(&mut self, model: &ProgressModel, force: bool) -> io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+
+        let now = self.clock.now();
+        let eligible = force
+            || self
+                .last_draw
+                .is_none_or(|last_draw| now.saturating_sub(last_draw) >= DRAW_INTERVAL);
+        if !eligible {
+            return Ok(());
+        }
+
+        let terminal = self.terminal_probe.probe();
+        let row = format_row(model, terminal.width, terminal.is_terminal);
+        if self.last_row.as_deref() == Some(&row) {
+            return Ok(());
+        }
+
+        self.write_row(&row, terminal.is_terminal, false)?;
+        self.last_row = Some(row);
+        self.last_draw = Some(now);
+        Ok(())
+    }
+
+    pub fn finish(&mut self, model: &ProgressModel) -> io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+
+        let now = self.clock.now();
+        let terminal = self.terminal_probe.probe();
+        let row = format_row(model, terminal.width, terminal.is_terminal);
+        self.write_row(&row, terminal.is_terminal, true)?;
+        self.last_row = Some(row);
+        self.last_draw = Some(now);
+        self.finished = true;
+        Ok(())
+    }
+
+    fn write_row(&mut self, row: &str, is_terminal: bool, finish: bool) -> io::Result<()> {
+        if is_terminal {
+            write!(self.writer, "\r{row}\x1b[K")?;
+            if finish {
+                self.writer.write_all(b"\n")?;
+            }
+        } else {
+            self.writer.write_all(row.as_bytes())?;
+            self.writer.write_all(b"\n")?;
+        }
+        self.writer.flush()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutMode {
