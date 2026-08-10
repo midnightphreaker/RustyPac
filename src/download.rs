@@ -1,6 +1,8 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytehaul::{
@@ -94,6 +96,94 @@ enum PauseTransition {
     Interrupt,
 }
 
+struct ResumeCheckpoint {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    output_path: PathBuf,
+    output_fingerprint: OutputFingerprint,
+    armed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OutputFingerprint {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl OutputFingerprint {
+    fn capture(path: &Path) -> Option<Self> {
+        let path_metadata = fs::symlink_metadata(path).ok()?;
+        if !path_metadata.file_type().is_file() {
+            return None;
+        }
+        let file_metadata = File::open(path).ok()?.metadata().ok()?;
+        let fingerprint = Self::from_metadata(&file_metadata);
+        (fingerprint == Self::from_metadata(&path_metadata)).then_some(fingerprint)
+    }
+
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            length: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+
+    fn still_matches(self, path: &Path) -> bool {
+        Self::capture(path) == Some(self)
+    }
+}
+
+impl ResumeCheckpoint {
+    fn capture(output: &Path) -> Option<Self> {
+        let output_fingerprint = OutputFingerprint::capture(output)?;
+        let path = sidecar_path(output);
+        let bytes = read_checkpoint(&path)?;
+        if OutputFingerprint::capture(output)? != output_fingerprint {
+            return None;
+        }
+        Some(Self {
+            path,
+            bytes,
+            output_path: output.to_owned(),
+            output_fingerprint,
+            armed: true,
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ResumeCheckpoint {
+    fn drop(&mut self) {
+        if self.armed
+            && matches!(
+                fs::symlink_metadata(&self.path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+            && self.output_fingerprint.still_matches(&self.output_path)
+        {
+            let _ = restore_checkpoint_atomically(
+                &self.path,
+                &self.bytes,
+                &self.output_path,
+                self.output_fingerprint,
+            );
+        }
+    }
+}
+
 pub async fn run<W, P, C>(
     url: &str,
     output: &Path,
@@ -120,6 +210,7 @@ where
             )
         }
     };
+    let mut resume_checkpoint = ResumeCheckpoint::capture(output);
 
     #[cfg(test)]
     let defer_interrupt_until_terminal = events.defer_interrupt_until_terminal;
@@ -198,6 +289,12 @@ where
             }
         }
     };
+
+    if result.is_ok() {
+        if let Some(checkpoint) = &mut resume_checkpoint {
+            checkpoint.disarm();
+        }
+    }
 
     match result {
         Ok(()) => match validate_and_clean(output) {
@@ -472,6 +569,83 @@ fn sidecar_path(output: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn read_checkpoint(path: &Path) -> Option<Vec<u8>> {
+    const MAX_CHECKPOINT_BYTES: u64 = 1024 * 1024;
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CHECKPOINT_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes).ok()?;
+    let path_metadata = fs::symlink_metadata(path).ok()?;
+    (metadata.dev() == path_metadata.dev()
+        && metadata.ino() == path_metadata.ino()
+        && metadata.len() == path_metadata.len())
+    .then_some(bytes)
+}
+
+fn restore_checkpoint_atomically(
+    path: &Path,
+    bytes: &[u8],
+    output: &Path,
+    output_fingerprint: OutputFingerprint,
+) -> std::io::Result<()> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let filename = path.file_name().unwrap_or(path.as_os_str());
+
+    for _ in 0..16 {
+        let mut temp_name = filename.to_os_string();
+        temp_name.push(format!(
+            ".rustypac-restore-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let temp_path = parent.join(temp_name);
+        let mut temp = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temp_path)
+        {
+            Ok(temp) => temp,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let write_result = temp.write_all(bytes).and_then(|()| temp.sync_all());
+        drop(temp);
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+
+        if !output_fingerprint.still_matches(output) {
+            let _ = fs::remove_file(&temp_path);
+            return Ok(());
+        }
+
+        let publish_result = fs::hard_link(&temp_path, path);
+        let _ = fs::remove_file(&temp_path);
+        return publish_result;
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate checkpoint restore path",
+    ))
+}
+
 fn display_filename(output: &Path) -> String {
     let filename = output
         .file_name()
@@ -497,4 +671,44 @@ fn is_database_signature(url: &str, output: &Path) -> bool {
         .unwrap_or(output.as_os_str())
         .to_string_lossy();
     url_filename.ends_with(".db.sig") && output_filename.ends_with(".db.sig.part")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_attempt_that_changes_output_does_not_restore_stale_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("changed.part");
+        let sidecar = sidecar_path(&output);
+        fs::write(&output, b"original partial bytes").unwrap();
+        fs::write(&sidecar, b"old checkpoint").unwrap();
+        let checkpoint = ResumeCheckpoint::capture(&output).unwrap();
+
+        fs::remove_file(&sidecar).unwrap();
+        fs::write(&output, b"changed! partial bytes").unwrap();
+        drop(checkpoint);
+
+        assert!(
+            !sidecar.exists(),
+            "checkpoint for superseded output bytes must not be restored"
+        );
+    }
+
+    #[test]
+    fn failed_attempt_keeps_newer_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("current.part");
+        let sidecar = sidecar_path(&output);
+        fs::write(&output, b"original partial bytes").unwrap();
+        fs::write(&sidecar, b"old checkpoint").unwrap();
+        let checkpoint = ResumeCheckpoint::capture(&output).unwrap();
+
+        fs::write(&output, b"current transfer bytes").unwrap();
+        fs::write(&sidecar, b"current checkpoint").unwrap();
+        drop(checkpoint);
+
+        assert_eq!(fs::read(&sidecar).unwrap(), b"current checkpoint");
+    }
 }

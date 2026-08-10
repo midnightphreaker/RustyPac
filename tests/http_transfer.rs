@@ -17,6 +17,7 @@ mod render;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -98,6 +99,35 @@ async fn download_with_control_queued_at_terminal(
     control.interrupt();
     let outcome = run(url, output, events, &mut renderer).await;
     (outcome, capture.text())
+}
+
+async fn create_interrupted_checkpoint(expected: &[u8], output: &Path) {
+    let slow_server = HttpServer::spawn(
+        ServerConfig::new("/resume", expected.to_vec(), ResponseMode::Ranges)
+            .throttled(8 * 1024, Duration::from_millis(8)),
+    );
+    let writer = CapturedWriter::default();
+    let mut renderer = Renderer::new(writer, || TerminalInfo::terminal(160), || Duration::ZERO);
+    let (control, events) = control_channel();
+    let url = slow_server.url("/resume");
+    let task_output = output.to_owned();
+    let task = tokio::spawn(async move { run(&url, &task_output, events, &mut renderer).await });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if output.exists() && !slow_server.requests().is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "download did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    control.interrupt();
+    assert_eq!(task.await.unwrap(), DownloadOutcome::Interrupted);
+    assert!(sidecar_path(output).exists());
 }
 
 #[tokio::test]
@@ -382,6 +412,84 @@ async fn interrupted_known_length_download_resumes_and_cleans_up() {
 #[tokio::test]
 async fn changed_url_after_interruption_still_completes_correctly() {
     interrupt_then_complete(true).await;
+}
+
+#[tokio::test]
+async fn failed_alternate_mirror_preserves_resume_state_for_later_mirror() {
+    let expected = body(768 * 1024);
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("mirror-fallback.pkg.part");
+    create_interrupted_checkpoint(&expected, &output).await;
+
+    let sidecar = sidecar_path(&output);
+    let partial_before_failure = fs::read(&output).unwrap();
+    let checkpoint_before_failure = fs::read(&sidecar).unwrap();
+    assert!(!partial_before_failure.is_empty());
+    assert!(checkpoint_before_failure.len() > 16);
+
+    let failing_server = HttpServer::spawn(ServerConfig::new(
+        "/resume",
+        Vec::new(),
+        ResponseMode::Status(404),
+    ));
+    let failed = Command::new(env!("CARGO_BIN_EXE_RustyPac"))
+        .arg(failing_server.url("/resume"))
+        .arg(&output)
+        .output()
+        .unwrap();
+
+    assert!(!failed.status.success());
+    assert_eq!(fs::read(&output).unwrap(), partial_before_failure);
+    assert_eq!(fs::read(&sidecar).unwrap(), checkpoint_before_failure);
+    assert_eq!(
+        fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "restored checkpoint must use private permissions"
+    );
+
+    let working_server = HttpServer::spawn(ServerConfig::new(
+        "/resume",
+        expected.clone(),
+        ResponseMode::Ranges,
+    ));
+    let (outcome, _) = download_once(&working_server.url("/resume"), &output).await;
+
+    assert_eq!(outcome, DownloadOutcome::Completed);
+    assert_eq!(fs::read(&output).unwrap(), expected);
+    assert!(
+        working_server
+            .requests()
+            .iter()
+            .filter_map(range_start)
+            .any(|start| start > 0),
+        "later working mirror must resume from a nonzero offset"
+    );
+    assert!(!sidecar.exists());
+}
+
+#[tokio::test]
+async fn failed_transfer_that_replaces_output_does_not_restore_stale_checkpoint() {
+    let expected = body(768 * 1024);
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("replaced.pkg.part");
+    create_interrupted_checkpoint(&expected, &output).await;
+    let sidecar = sidecar_path(&output);
+    let partial_before_failure = fs::read(&output).unwrap();
+    let checkpoint_before_failure = fs::read(&sidecar).unwrap();
+
+    let failing_server = HttpServer::spawn(ServerConfig::new(
+        "/replacement",
+        body(128 * 1024),
+        ResponseMode::TruncatedRanges,
+    ));
+    let (outcome, _) = download_once(&failing_server.url("/replacement"), &output).await;
+
+    assert_eq!(outcome, DownloadOutcome::Failed);
+    assert_ne!(fs::read(&output).unwrap(), partial_before_failure);
+    assert!(
+        !sidecar.exists() || fs::read(&sidecar).unwrap() != checkpoint_before_failure,
+        "stale checkpoint must not be restored for replacement output bytes"
+    );
 }
 
 #[test]

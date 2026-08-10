@@ -9,6 +9,7 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub enum ResponseMode {
     Ranges,
+    TruncatedRanges,
     IgnoreRanges,
     UnknownLength,
     Status(u16),
@@ -152,12 +153,42 @@ fn serve_connection(
 
     match config.mode {
         ResponseMode::Ranges => write_range_response(&mut stream, config, &request, bytes_sent),
+        ResponseMode::TruncatedRanges => {
+            write_truncated_range_response(&mut stream, config, &request)
+        }
         ResponseMode::IgnoreRanges => {
             write_known_response(&mut stream, config, 200, &config.body, bytes_sent)
         }
         ResponseMode::UnknownLength => write_unknown_response(&mut stream, config, bytes_sent),
         ResponseMode::Status(status) => write_status(&mut stream, status),
     }
+}
+
+fn write_truncated_range_response(
+    stream: &mut TcpStream,
+    config: &ServerConfig,
+    request: &RecordedRequest,
+) -> std::io::Result<()> {
+    let Some(range) = request.header("range") else {
+        return write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            config.body.len()
+        );
+    };
+    let Some((start, end)) = parse_range(range, config.body.len()) else {
+        return write!(
+            stream,
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nContent-Range: bytes */{}\r\nConnection: close\r\n\r\n",
+            config.body.len()
+        );
+    };
+    write!(
+        stream,
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nAccept-Ranges: bytes\r\nETag: \"rustypac-fixture\"\r\nLast-Modified: Sat, 01 Aug 2026 00:00:00 GMT\r\nConnection: close\r\n\r\n",
+        end - start + 1,
+        config.body.len()
+    )
 }
 
 fn read_request(stream: &TcpStream) -> std::io::Result<RecordedRequest> {
