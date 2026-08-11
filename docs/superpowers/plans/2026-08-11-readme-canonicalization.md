@@ -67,7 +67,7 @@ cargo build --release
 git diff --check
 ```
 
-Expected: formatting and Clippy pass, 93 normal tests pass with 2 privileged tests ignored, release build and diff check pass.
+Expected: formatting and Clippy pass, 93 total tests: 91 pass and 2 privileged tests are ignored; release build and diff check pass.
 
 - [ ] **Step 5: Review and commit**
 
@@ -76,5 +76,6 @@ Require a fresh documentation review with zero BLOCKING findings, then run:
 ```sh
 git add README.md
 git commit -m "docs: canonicalize current RustyPac behavior"
-git push origin main
 ```
+
+Commit on the `readme-canonicalization` branch. The controller will integrate or cherry-pick reviewed commits onto `main` and push `main`; do not push from the isolated worktree.
