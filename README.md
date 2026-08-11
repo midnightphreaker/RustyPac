@@ -5,7 +5,7 @@ RustyPac is a small external downloader for pacman on Arch Linux/CachyOS. It use
 ## Requirements
 
 - Arch Linux or CachyOS on Linux, with pacman and its `alpm` download user.
-- Rust 1.97.1 development toolchain (the crate uses edition 2021).
+- RustyPac is tested with Rust 1.97.1; `Cargo.toml` does not declare that as a minimum supported Rust version (the crate uses edition 2021).
 - bytehaul `0.2.0` (pinned by `Cargo.toml`). bytehaul is deliberately a small, low-maturity dependency here; the included local HTTP and live-pacman gates cover the supported behavior.
 - `sudo` for installation, configuration changes, and the optional privileged compatibility gate.
 
@@ -68,7 +68,7 @@ The command accepts exactly `URL OUTPUT`. Keep `OUTPUT` as the desired pacman `.
 
 ## Progress and recovery
 
-TTY output refreshes at most once per second, skips unchanged frames, redraws immediately after resize or a terminal state, and finishes with one newline. It selects `Full`, `Small`, `Minimal`, `Compact`, `Plain`, then `Extreme` as space decreases. Structured rows reserve at least 23 display cells for the filename; Unicode-safe truncation uses `...`. Full shows a bar, percentage, transferred/total, speed, and `DONE`/`ETA`; smaller modes progressively omit fields. Active content is white, success green, unavailable optional signatures dark gray with a broken-chain icon, errors red, and structured separators purple. Redirected output is plain, flushed, newline-delimited, and rate-limited the same way.
+Routine active frames update at one-second intervals and re-probe terminal width; `SIGWINCH` forces an immediate redraw. TTY output skips unchanged frames and finishes with one newline. It selects `Full`, `Small`, `Minimal`, `Compact`, `Plain`, then `Extreme` as space decreases. Structured state rows keep fixed field boundaries, and interactive output reserves one right-edge cell to prevent autowrap. Structured rows reserve at least 23 display cells for the filename; Unicode-safe truncation uses `...`. Full shows a bar, percentage, transferred/total, speed, and `DONE`/`ETA`; smaller modes progressively omit fields. Active content is white, success green, unavailable optional signatures dark gray with a broken-chain icon, errors red, and structured separators purple. Redirected output is plain, flushed, newline-delimited, and rate-limited the same way.
 
 Known-length range transfers use bytehaul resume state at `<OUTPUT>.bytehaul`; a no-range server falls back to one stream. `SIGINT`, `SIGTERM`, and `SIGHUP` cancel cooperatively, retain valid partial/resume state, restore the terminal, and exit nonzero. `SIGTSTP` checkpoints before stopping; `SIGCONT` revalidates, resumes, and redraws. `SIGKILL` cannot be handled, but the next invocation recovers a verified stale lock.
 
@@ -102,4 +102,4 @@ sudo pacman -Syy vim --noconfirm
 - Unknown-length responses are downloaded in one stream and do not promise resume.
 - There is no aria2 control-file compatibility or fallback, daemon, GUI, mirror manager, package-manager features, or live connection count.
 - If pacman cannot execute RustyPac, confirm `/usr/local/bin/RustyPac` exists and remains readable/executable by `alpm`, then check `pacman-conf XferCommand`.
-- If a live transfer misbehaves, run `sudo /usr/local/bin/RustyPac --disable`, confirm with `y`, and choose the default pacman behaviour at the second prompt. This restores pacman's built-in downloader without discarding a preserved prior command.
+- If a live transfer misbehaves, run `sudo /usr/local/bin/RustyPac --disable` and confirm with `y`. The existing-XferCommand choice appears only if a previous command was preserved; otherwise disabling directly restores pacman's built-in downloader.
