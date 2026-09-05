@@ -1,0 +1,27 @@
+{
+  "version_files": [
+    {
+      "path": "Cargo.toml",
+      "pattern": "(?m)^version = \"(?P<version>[0-9.]+)\"",
+      "count": 1
+    },
+    {
+      "path": "Cargo.lock",
+      "pattern": "(?m)^name = \"rustypac\"\\nversion = \"(?P<version>[0-9.]+)\"",
+      "count": 1
+    }
+  ],
+  "checks": [
+    "bash .forgejo/setup-rust.sh",
+    "export PATH=\"${CARGO_HOME:-$HOME/.cargo}/bin:$PATH\"; cargo fmt --all -- --check",
+    "export PATH=\"${CARGO_HOME:-$HOME/.cargo}/bin:$PATH\"; cargo clippy --workspace --all-targets --all-features --locked -- -D warnings",
+    "export PATH=\"${CARGO_HOME:-$HOME/.cargo}/bin:$PATH\"; cargo test --workspace --all-features --locked"
+  ],
+  "build": [
+    "export PATH=\"${CARGO_HOME:-$HOME/.cargo}/bin:$PATH\"; rustup target add x86_64-unknown-linux-gnu; cargo build --release --locked --target x86_64-unknown-linux-gnu",
+    "python3 .forgejo/package.py binary linux amd64 target/x86_64-unknown-linux-gnu/release/RustyPac README.md VERSION"
+  ],
+  "artifacts": [
+    ".release-dist/${RELEASE_NAME}.v${RELEASE_VERSION}-linux-amd64.tar.gz"
+  ]
+}

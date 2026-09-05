@@ -1,5 +1,7 @@
 # RustyPac
 
+Repository: https://git.phrk.org/pub/RustyPac
+
 RustyPac is a small external downloader for pacman on Arch Linux/CachyOS. It uses bytehaul for segmented HTTP downloads and resumable known-length transfers, writes to pacman's exact `.part` path, and shows a clean adaptive progress row. Pacman still chooses mirrors, applies signature policy, and performs the final `.part` rename.
 
 ## Requirements

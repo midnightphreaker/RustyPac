@@ -1,3 +1,9 @@
 .worktrees/
 .superpowers/
 target/
+
+# Generated release outputs and tool environments.
+/.release-dist/
+/.release-bootstrap/
+/.release-venv/
+/.forgejo/__pycache__/

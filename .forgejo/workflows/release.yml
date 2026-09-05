@@ -1,0 +1,37 @@
+name: Release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Major: +0.1.0; minor: +0.0.1; retry: publish current version'
+        required: true
+        default: minor
+        type: choice
+        options: [Major, minor, retry]
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: linux-amd64
+    env:
+      CONTAINER_HOST: unix:///var/run/docker.sock
+    steps:
+      - name: Install release prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 python3-venv git curl ca-certificates tar zip podman
+          test -S /var/run/docker.sock
+          podman info >/dev/null
+      - name: Checkout full history
+        uses: https://github.com/actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check, build and publish
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_USER: ${{ secrets.RELEASE_USER }}
+        run: python3 .forgejo/release.py
