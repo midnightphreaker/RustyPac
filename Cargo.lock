@@ -1318,6 +1318,7 @@ version = "0.1.0"
 dependencies = [
  "bytehaul",
  "libc",
+ "sha2",
  "tempfile",
  "terminal_size",
  "tokio",

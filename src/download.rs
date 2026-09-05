@@ -9,6 +9,7 @@ use bytehaul::{
     DownloadError, DownloadHandle, DownloadSpec, DownloadState, Downloader, FileAllocation,
     ProgressSnapshot,
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::lock::OutputLock;
@@ -113,6 +114,7 @@ struct OutputFingerprint {
     modified_nanoseconds: i64,
     changed_seconds: i64,
     changed_nanoseconds: i64,
+    content_hash: [u8; 32],
 }
 
 impl OutputFingerprint {
@@ -121,9 +123,33 @@ impl OutputFingerprint {
         if !path_metadata.file_type().is_file() {
             return None;
         }
-        let file_metadata = File::open(path).ok()?.metadata().ok()?;
-        let fingerprint = Self::from_metadata(&file_metadata);
-        (fingerprint == Self::from_metadata(&path_metadata)).then_some(fingerprint)
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+            .ok()?;
+        let mut fingerprint = Self::from_metadata(&file.metadata().ok()?);
+        if fingerprint != Self::from_metadata(&path_metadata) {
+            return None;
+        }
+
+        // Same-length writes can share both timestamps on coarse filesystem clocks.
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).ok()?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        if fingerprint != Self::from_metadata(&file.metadata().ok()?)
+            || fingerprint != Self::from_metadata(&fs::symlink_metadata(path).ok()?)
+        {
+            return None;
+        }
+        fingerprint.content_hash = hasher.finalize().into();
+        Some(fingerprint)
     }
 
     fn from_metadata(metadata: &fs::Metadata) -> Self {
@@ -135,6 +161,7 @@ impl OutputFingerprint {
             modified_nanoseconds: metadata.mtime_nsec(),
             changed_seconds: metadata.ctime(),
             changed_nanoseconds: metadata.ctime_nsec(),
+            content_hash: [0; 32],
         }
     }
 
@@ -145,8 +172,12 @@ impl OutputFingerprint {
 
 impl ResumeCheckpoint {
     fn capture(output: &Path) -> Option<Self> {
-        let output_fingerprint = OutputFingerprint::capture(output)?;
         let path = sidecar_path(output);
+        // Eligibility only: authoritative checkpoint bytes are read after the output.
+        if !fs::symlink_metadata(&path).ok()?.file_type().is_file() {
+            return None;
+        }
+        let output_fingerprint = OutputFingerprint::capture(output)?;
         let bytes = read_checkpoint(&path)?;
         if OutputFingerprint::capture(output)? != output_fingerprint {
             return None;
@@ -693,6 +724,31 @@ mod tests {
         assert!(
             !sidecar.exists(),
             "checkpoint for superseded output bytes must not be restored"
+        );
+    }
+
+    #[test]
+    fn same_metadata_does_not_hide_changed_output_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("same-metadata.part");
+        let sidecar = sidecar_path(&output);
+        fs::write(&output, b"original partial bytes").unwrap();
+        fs::write(&sidecar, b"old checkpoint").unwrap();
+        let mut checkpoint = ResumeCheckpoint::capture(&output).unwrap();
+
+        fs::remove_file(&sidecar).unwrap();
+        fs::write(&output, b"changed! partial bytes").unwrap();
+        let current = OutputFingerprint::capture(&output).unwrap();
+        // Reproduce a filesystem clock tick shared by both same-length writes.
+        checkpoint.output_fingerprint.modified_seconds = current.modified_seconds;
+        checkpoint.output_fingerprint.modified_nanoseconds = current.modified_nanoseconds;
+        checkpoint.output_fingerprint.changed_seconds = current.changed_seconds;
+        checkpoint.output_fingerprint.changed_nanoseconds = current.changed_nanoseconds;
+        drop(checkpoint);
+
+        assert!(
+            !sidecar.exists(),
+            "equal metadata must not permit restoring a checkpoint for different bytes"
         );
     }
 
