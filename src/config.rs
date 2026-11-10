@@ -150,9 +150,24 @@ pub fn plan_enable(contents: &[u8], executable: &str) -> Result<EditPlan, Config
     let analysis = analyze(contents, executable)?;
     let initial_state = analysis.state.clone();
     if analysis.state == ConfigState::Active {
+        let mut replacement = contents.to_vec();
+        if let (Some(rusty), Ok(insertion)) = (analysis.rusty, options_insertion_point(contents)) {
+            // Repair commands inserted by older releases below the options comments.
+            if insertion < rusty.start {
+                let mut command = active_command(executable).into_bytes();
+                command.extend_from_slice(preferred_newline(contents));
+                replacement = apply_edits(
+                    contents,
+                    vec![
+                        (insertion, insertion, command),
+                        (rusty.start, rusty.end, Vec::new()),
+                    ],
+                );
+            }
+        }
         return Ok(EditPlan {
             original: contents.to_vec(),
-            replacement: contents.to_vec(),
+            replacement,
             initial_state,
             expected_state: ConfigState::Active,
             executable: executable.to_owned(),
@@ -876,11 +891,18 @@ fn options_insertion_point(contents: &[u8]) -> Result<usize, ConfigError> {
             "exactly one [options] section is required".to_owned(),
         ));
     };
-    Ok(config_lines
-        .iter()
-        .skip(options_index + 1)
-        .find(|line| is_section_header(trim_ascii(line.content(contents))))
-        .map_or(contents.len(), |line| line.start))
+    let mut section_end = contents.len();
+    for line in config_lines.iter().skip(options_index + 1) {
+        let text = trim_ascii(line.content(contents));
+        if is_section_header(text) {
+            section_end = line.start;
+            break;
+        }
+        if strip_comment(text).is_some_and(starts_with_xfer_command) {
+            return Ok(line.start);
+        }
+    }
+    Ok(section_end)
 }
 
 fn is_section_header(line: &[u8]) -> bool {

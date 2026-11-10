@@ -5,6 +5,7 @@ pub mod download;
 mod lock;
 pub mod progress;
 pub mod render;
+pub mod settings;
 pub mod signals;
 
 use std::io::IsTerminal;
@@ -17,14 +18,28 @@ use render::{Renderer, TerminalInfo};
 use signals::SignalEvent;
 
 fn main() -> ExitCode {
-    match cli::parse_args(std::env::args()) {
-        Ok(Command::Download { url, output }) => run_download(&url, &output),
-        Ok(Command::Enable) => run_config_interaction(true),
-        Ok(Command::Disable) => run_config_interaction(false),
+    let command = match cli::parse_args(std::env::args()) {
+        Ok(command) => command,
         Err(error) => {
             eprintln!("RustyPac: {error}");
-            ExitCode::from(2)
+            return ExitCode::from(2);
         }
+    };
+    // Disabling integration must still work when the download configuration is broken.
+    if command == Command::Disable {
+        return run_config_interaction(false);
+    }
+    let settings = match settings::load() {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("RustyPac: failed to load configuration: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match command {
+        Command::Download { url, output } => run_download(&url, &output, &settings),
+        Command::Enable => run_config_interaction(true),
+        Command::Disable => run_config_interaction(false),
     }
 }
 
@@ -52,7 +67,7 @@ fn run_config_interaction(enable: bool) -> ExitCode {
     }
 }
 
-fn run_download(url: &str, output: &std::path::Path) -> ExitCode {
+fn run_download(url: &str, output: &std::path::Path, settings: &settings::Settings) -> ExitCode {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -98,7 +113,8 @@ fn run_download(url: &str, output: &std::path::Path) -> ExitCode {
                 signals::record_test_delivery(event);
             }
         });
-        let outcome = download::run(url, output, events, &mut renderer).await;
+        let outcome =
+            download::run_with_settings(url, output, events, &mut renderer, settings).await;
         signal_task.abort();
         outcome
     });

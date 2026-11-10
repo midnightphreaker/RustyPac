@@ -25,7 +25,7 @@ pub fn run_enable<R: BufRead, W: Write>(path: &Path, input: &mut R, output: &mut
         Ok(plan) => plan,
         Err(error) => return config_failure(output, "inspect", error, path),
     };
-    if plan.initial_state() == &ConfigState::Active {
+    if plan.initial_state() == &ConfigState::Active && !plan.changed() {
         let _ = writeln!(output, "RustyPac is already active");
         return RunStatus::Success;
     }

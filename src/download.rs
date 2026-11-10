@@ -5,16 +5,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bytehaul::{
-    DownloadError, DownloadHandle, DownloadSpec, DownloadState, Downloader, FileAllocation,
-    ProgressSnapshot,
-};
+use bytehaul::{DownloadError, DownloadHandle, DownloadState, Downloader, ProgressSnapshot};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::lock::OutputLock;
 use crate::progress::{DisplayState, ProgressModel};
 use crate::render::{Clock, Renderer, TerminalProbe};
+use crate::settings::Settings;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DownloadOutcome {
@@ -218,8 +216,23 @@ impl Drop for ResumeCheckpoint {
 pub async fn run<W, P, C>(
     url: &str,
     output: &Path,
+    events: ControlEvents,
+    renderer: &mut Renderer<W, P, C>,
+) -> DownloadOutcome
+where
+    W: Write,
+    P: TerminalProbe,
+    C: Clock,
+{
+    run_with_settings(url, output, events, renderer, &Settings::default()).await
+}
+
+pub async fn run_with_settings<W, P, C>(
+    url: &str,
+    output: &Path,
     mut events: ControlEvents,
     renderer: &mut Renderer<W, P, C>,
+    settings: &Settings,
 ) -> DownloadOutcome
 where
     W: Write,
@@ -241,7 +254,10 @@ where
             )
         }
     };
-    let mut resume_checkpoint = ResumeCheckpoint::capture(output);
+    let mut resume_checkpoint = settings
+        .resume
+        .then(|| ResumeCheckpoint::capture(output))
+        .flatten();
 
     #[cfg(test)]
     let defer_interrupt_until_terminal = events.defer_interrupt_until_terminal;
@@ -260,9 +276,7 @@ where
                 )
             }
         };
-        let spec = DownloadSpec::new(url)
-            .output_path(output.to_owned())
-            .file_allocation(FileAllocation::None);
+        let spec = settings.spec(url, output);
         let handle = downloader.download(spec);
         let progress = handle.subscribe_progress();
 

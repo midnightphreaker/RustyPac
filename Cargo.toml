@@ -14,6 +14,6 @@ unicode-width = "0.2"
 terminal_size = "0.4"
 libc = "0.2"
 sha2 = "0.11"
-
-[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "2.1", default-features = false, features = ["serialize", "deserialize"] }
 tempfile = "3"

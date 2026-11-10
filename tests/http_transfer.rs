@@ -13,6 +13,9 @@ mod progress;
 #[allow(dead_code)]
 #[path = "../src/render.rs"]
 mod render;
+#[allow(dead_code)]
+#[path = "../src/settings.rs"]
+mod settings;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -433,6 +436,7 @@ async fn failed_alternate_mirror_preserves_resume_state_for_later_mirror() {
         ResponseMode::Status(404),
     ));
     let failed = Command::new(env!("CARGO_BIN_EXE_RustyPac"))
+        .env("RUSTYPAC_CONFIG", directory.path().join("config.yaml"))
         .arg(failing_server.url("/resume"))
         .arg(&output)
         .output()
@@ -492,6 +496,38 @@ async fn failed_transfer_that_replaces_output_does_not_restore_stale_checkpoint(
     );
 }
 
+#[tokio::test]
+async fn configured_restart_ignores_existing_checkpoint_and_redownloads_full_file() {
+    let expected = body(768 * 1024);
+    let directory = tempdir().unwrap();
+    let output = directory.path().join("restart.part");
+    create_interrupted_checkpoint(&expected, &output).await;
+    let config = directory.path().join("config.yaml");
+    fs::write(&config, "resume: false\nconnections_per_file: 1\n").unwrap();
+    let server = HttpServer::spawn(ServerConfig::new(
+        "/resume",
+        expected.clone(),
+        ResponseMode::Ranges,
+    ));
+    let result = Command::new(env!("CARGO_BIN_EXE_RustyPac"))
+        .env("RUSTYPAC_CONFIG", &config)
+        .arg(server.url("/resume"))
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(fs::read(&output).unwrap(), expected);
+    assert!(
+        server
+            .requests()
+            .iter()
+            .filter_map(range_start)
+            .all(|start| start == 0),
+        "restart must not request a saved nonzero offset"
+    );
+    assert!(!sidecar_path(&output).exists());
+}
+
 #[test]
 fn binary_returns_zero_only_for_verified_completion() {
     let expected = body(32 * 1024);
@@ -504,6 +540,7 @@ fn binary_returns_zero_only_for_verified_completion() {
     let success_output = directory.path().join("success.part");
 
     let success = Command::new(env!("CARGO_BIN_EXE_RustyPac"))
+        .env("RUSTYPAC_CONFIG", directory.path().join("config.yaml"))
         .arg(success_server.url("/success"))
         .arg(&success_output)
         .output()
@@ -519,6 +556,7 @@ fn binary_returns_zero_only_for_verified_completion() {
     ));
     let failure_output = directory.path().join("missing.part");
     let failure = Command::new(env!("CARGO_BIN_EXE_RustyPac"))
+        .env("RUSTYPAC_CONFIG", directory.path().join("config.yaml"))
         .arg(failure_server.url("/missing"))
         .arg(failure_output)
         .output()

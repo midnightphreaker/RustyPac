@@ -145,6 +145,7 @@ impl ChildGuard {
         let (master, slave) = open_pty(width);
         let mut command = Command::new(env!("CARGO_BIN_EXE_RustyPac"));
         command
+            .env("RUSTYPAC_CONFIG", output.with_extension("config.yaml"))
             .arg(url)
             .arg(output)
             .stdout(Stdio::from(slave))

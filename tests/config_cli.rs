@@ -115,6 +115,24 @@ fn enabling_when_absent_inserts_in_options_before_repository_sections() {
 }
 
 #[test]
+fn absent_enable_inserts_before_commented_xfer_examples_not_repository_preamble() {
+    let before = b"[options]\nHoldPkg = pacman glibc\n#XferCommand = /usr/bin/curl %u -o %o\n#XferCommand = /usr/bin/wget %u -O %o\nColor\n\n# REPOSITORIES\n#[testing]\n[core]\nInclude = mirrorlist\n";
+    let plan = plan_enable(before, "/usr/local/bin/RustyPac").unwrap();
+    assert_eq!(plan.contents(), b"[options]\nHoldPkg = pacman glibc\nXferCommand = /usr/local/bin/RustyPac %u %o\n#XferCommand = /usr/bin/curl %u -o %o\n#XferCommand = /usr/bin/wget %u -O %o\nColor\n\n# REPOSITORIES\n#[testing]\n[core]\nInclude = mirrorlist\n");
+}
+
+#[test]
+fn enable_relocates_legacy_active_command_to_commented_examples() {
+    let before = b"[options]\r\n#XferCommand = /usr/bin/curl %u -o %o\r\nColor\r\n\r\n# REPOSITORIES\r\nXferCommand = /usr/local/bin/RustyPac %u %o\r\n[core]\r\n";
+    let plan = plan_enable(before, "/usr/local/bin/RustyPac").unwrap();
+    assert!(plan.changed());
+    assert_eq!(plan.contents(), b"[options]\r\nXferCommand = /usr/local/bin/RustyPac %u %o\r\n#XferCommand = /usr/bin/curl %u -o %o\r\nColor\r\n\r\n# REPOSITORIES\r\n[core]\r\n");
+    assert!(!plan_enable(plan.contents(), "/usr/local/bin/RustyPac")
+        .unwrap()
+        .changed());
+}
+
+#[test]
 fn absent_enable_rejects_missing_or_ambiguous_options_sections() {
     for contents in [
         b"[core]\nInclude = /etc/pacman.d/mirrorlist\n".as_slice(),

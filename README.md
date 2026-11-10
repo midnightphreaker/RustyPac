@@ -4,6 +4,8 @@ Repository: https://git.phrk.org/pub/RustyPac
 
 RustyPac is a small external downloader for pacman on Arch Linux/CachyOS. It uses bytehaul for segmented HTTP downloads and resumable known-length transfers, writes to pacman's exact `.part` path, and shows a clean adaptive progress row. Pacman still chooses mirrors, applies signature policy, and performs the final `.part` rename.
 
+**Download parallelism:** RustyPac can split one file across multiple connections. Pacman's `XferCommand` interface still supplies files one at a time; it does not support parallel package-file downloads. See [the parallel-download limitation](#parallel-package-files-pacman-limitation) before choosing RustyPac over pacman's built-in downloader.
+
 ## Requirements
 
 - Arch Linux or CachyOS on Linux, with pacman and its `alpm` download user.
@@ -28,13 +30,22 @@ Enable the installed binary:
 sudo /usr/local/bin/RustyPac --enable
 ```
 
-`--enable` is a no-op when RustyPac is already active. Otherwise it asks `Enable RustyPac? [y/N]`; only `Y` or `y` changes `/etc/pacman.conf`. When run without root privileges, it first says that changing `pacman.conf` requires sudo. An existing active `XferCommand` is retained as:
+`--enable` inserts the active line immediately before the commented curl/wget `XferCommand` examples in `[options]`, leaving those examples intact. If no examples exist, it inserts before the next repository section. It also relocates an active command left below the examples by an older release. `--enable` is a no-op when RustyPac is already active in the correct location. Otherwise it asks `Enable RustyPac? [y/N]`; only `Y` or `y` changes `/etc/pacman.conf`. When run without root privileges, it first says that changing `pacman.conf` requires sudo. An existing active `XferCommand` is retained as:
 
 ```text
 ## Pre-RustyPac XferCommand ## XferCommand = ...
 ```
 
-and RustyPac activates `XferCommand = /usr/local/bin/RustyPac %u %o`.
+The resulting placement in a standard configuration is:
+
+```ini
+[options]
+# ... existing options ...
+XferCommand = /usr/local/bin/RustyPac %u %o
+#XferCommand = /usr/bin/curl -L -C - -f -o %o %u
+#XferCommand = /usr/bin/wget --passive-ftp -c -O %o %u
+# ... remaining options and repository definitions ...
+```
 
 Disable RustyPac with:
 
@@ -68,11 +79,73 @@ target/release/RustyPac 'https://example.invalid/package.pkg.tar.zst' /tmp/packa
 
 The command accepts exactly `URL OUTPUT`. Keep `OUTPUT` as the desired pacman `.part` path: RustyPac never renames it. A zero exit means the output is complete, readable, and nonempty; failures and skipped optional database signatures return nonzero so pacman can follow its mirror/signature policy.
 
+## Download configuration
+
+### File location and automatic recovery
+
+On `--enable` or a download, RustyPac reads:
+
+```text
+$HOME/.config/RustyPac/config.yaml
+```
+
+- **Missing file:** creates the directory and writes the defaults below.
+- **Valid file:** reads your settings without rewriting the file or removing comments. Omitted settings use defaults.
+- **Corrupt or invalid file:** warns and replaces it with defaults. This includes malformed YAML, unknown setting names, wrong types, and out-of-range values.
+- **I/O error:** reports the problem and stops, rather than overwriting an unreadable file.
+
+Settings are read on each invocation; no rebuild or service restart is needed. `--disable` works independently of the download configuration.
+
+### Supported settings and defaults
+
+```yaml
+resume: true                  # false = restart existing incomplete downloads
+connections_per_file: 4       # simultaneous split connections, 1..128
+connections_per_server: 4     # cap for this file's server, 1..128
+min_split_size: 10485760      # split files at/above this many bytes (10 MiB)
+piece_size: 1048576           # resume/split piece size in bytes (1 MiB)
+connect_timeout_secs: 30
+read_timeout_secs: 60
+max_retries: 5                # retry attempts per segment; 0 = none
+max_download_speed: 0         # bytes/sec per file; 0 = unlimited
+```
+
+Each download has one URL, so its effective connection limit is the **smaller** of `connections_per_file` and `connections_per_server`. Servers without range support still use one stream. `min_split_size` must be positive, `piece_size` is 1 byte through 64 MiB, and timeouts are 1 through 86400 seconds. With `resume: false`, incomplete transfers restart rather than using saved checkpoints, including after suspend/continue.
+
+### Tuning connections and resume behavior
+
+To allow up to eight connections for each file, edit **both** limits in your existing file:
+
+```yaml
+connections_per_file: 8
+connections_per_server: 8
+```
+
+Increasing only one limit leaves the other as the cap. Files below `min_split_size`, or servers without range support, do not gain extra connections just because the limits are higher. Adjust `min_split_size` if you want smaller files to be eligible for splitting.
+
+Keep `resume: true` to reuse valid incomplete-download checkpoints. Set `resume: false` to download incomplete files again from the beginning. Resume depends on a known-length transfer and valid bytehaul state; an arbitrary existing `.part` file alone does not guarantee resume.
+
+### Selecting the configuration when using sudo
+
+The path uses the **process's HOME**: `sudo` commonly changes it to `/root`, so normal-user and sudo invocations can use different files. `RUSTYPAC_CONFIG=/absolute/path/config.yaml` overrides the location. For example, to make a sudo pacman invocation use your existing user config explicitly:
+
+```sh
+sudo env RUSTYPAC_CONFIG="$HOME/.config/RustyPac/config.yaml" pacman -Syu
+```
+
+Create/edit the user file as your normal user first; if root creates it through this override, it will be root-owned. Paths must be accessible to the account running RustyPac.
+
+### Parallel package files: pacman limitation
+
+**RustyPac cannot make pacman download multiple package files in parallel through `XferCommand`.** Pacman passes one URL/output pair and waits for the external command before passing the next. Its `ParallelDownloads` option controls the built-in downloader, not this external callback. Consequently there is no misleading `parallel_files` setting here. The YAML connection settings speed up segments **within a file**, not concurrent package files.
+
+For parallel package files today, disable RustyPac (`sudo /usr/local/bin/RustyPac --disable`) and use pacman's built-in `ParallelDownloads`. Supporting parallel package files with bytehaul requires a separate batch-aware integration; returning success before a `.part` file is complete would break pacman's contract. See pacman's [external callback loop](https://github.com/devkitPro/pacman/blob/master/lib/libalpm/dload.c) and [synchronous command execution](https://github.com/devkitPro/pacman/blob/master/src/pacman/conf.c).
+
 ## Progress and recovery
 
 Routine active frames update at one-second intervals and re-probe terminal width; `SIGWINCH` forces an immediate redraw. TTY output skips unchanged frames and finishes with one newline. It selects `Full`, `Small`, `Minimal`, `Compact`, `Plain`, then `Extreme` as space decreases. Structured state rows keep fixed field boundaries, and interactive output reserves one right-edge cell to prevent autowrap. Structured rows reserve at least 23 display cells for the filename; Unicode-safe truncation uses `...`. Full shows a bar, percentage, transferred/total, speed, and `DONE`/`ETA`; smaller modes progressively omit fields. Active content is white, success green, unavailable optional signatures dark gray with a broken-chain icon, errors red, and structured separators purple. Redirected output is plain, flushed, newline-delimited, and rate-limited the same way.
 
-Known-length range transfers use bytehaul resume state at `<OUTPUT>.bytehaul`; a no-range server falls back to one stream. `SIGINT`, `SIGTERM`, and `SIGHUP` cancel cooperatively, retain valid partial/resume state, restore the terminal, and exit nonzero. `SIGTSTP` checkpoints before stopping; `SIGCONT` revalidates, resumes, and redraws. `SIGKILL` cannot be handled, but the next invocation recovers a verified stale lock.
+With the default `resume: true`, known-length range transfers use bytehaul resume state at `<OUTPUT>.bytehaul`; a no-range server falls back to one stream. `SIGINT`, `SIGTERM`, and `SIGHUP` cancel cooperatively, retain valid partial/resume state, restore the terminal, and exit nonzero. `SIGTSTP` checkpoints before stopping; `SIGCONT` revalidates, resumes, and redraws. With `resume: false`, incomplete transfers restart instead of reusing saved checkpoints. `SIGKILL` cannot be handled, but the next invocation recovers a verified stale lock.
 
 An HTTP 404 or 410 is shown as an unavailable skip only for a matching `.db.sig` URL and `.db.sig.part` output. This supports pacman's `DatabaseOptional` policy; package signatures and all other errors are hard failures.
 

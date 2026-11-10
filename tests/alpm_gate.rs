@@ -170,7 +170,11 @@ fn release_binary_writes_exact_absolute_part_output_as_alpm() {
         .expect("transfer gate directory to alpm");
 
     let status = Command::new("sudo")
-        .args(["-n", "-u", "alpm", "--"])
+        .args(["-n", "-u", "alpm", "--", "env"])
+        .arg(format!(
+            "RUSTYPAC_CONFIG={}",
+            directory.path().join("config.yaml").display()
+        ))
         .arg(&binary)
         .arg(server.url("/package.pkg.tar.zst"))
         .arg(&output)
