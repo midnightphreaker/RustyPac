@@ -1,10 +1,13 @@
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bytehaul::{DownloadSpec, FileAllocation};
 use serde::{Deserialize, Serialize};
+
+const SYSTEM_CONFIG: &str = "/etc/RustyPac/config.yaml";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -63,27 +66,65 @@ impl Settings {
 }
 
 pub fn load() -> io::Result<Settings> {
-    let path = if let Some(path) = std::env::var_os("RUSTYPAC_CONFIG").filter(|p| !p.is_empty()) {
-        PathBuf::from(path)
-    } else {
-        let home = std::env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
-        PathBuf::from(home).join(".config/RustyPac/config.yaml")
-    };
-    load_path(&path)
-        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+    if let Some(path) = std::env::var_os("RUSTYPAC_CONFIG").filter(|p| !p.is_empty()) {
+        let path = PathBuf::from(path);
+        return load_path(&path)
+            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())));
+    }
+    let shared = Path::new(SYSTEM_CONFIG);
+    match std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+        Some(home) => load_implicit(
+            &PathBuf::from(home).join(".config/RustyPac/config.yaml"),
+            shared,
+        ),
+        None => Ok(load_shared(shared)),
+    }
+}
+
+fn load_implicit(home: &Path, shared: &Path) -> io::Result<Settings> {
+    // Pacman can retain HOME=/root after dropping to its download account.
+    // An implicit private path must not prevent package downloads.
+    match load_path(home) {
+        Ok(settings) => Ok(settings),
+        Err(_) => Ok(load_shared(shared)),
+    }
+}
+
+fn load_shared(path: &Path) -> Settings {
+    if let Some(settings) = fs::read(path).ok().and_then(|bytes| parse_settings(&bytes)) {
+        return settings;
+    }
+    eprintln!(
+        "RustyPac: personal configuration unavailable and no valid {}; using built-in defaults",
+        path.display()
+    );
+    Settings::default()
+}
+
+fn parse_settings(bytes: &[u8]) -> Option<Settings> {
+    let yaml = std::str::from_utf8(bytes).ok()?;
+    let settings: Settings = serde_saphyr::from_str(yaml).ok()?;
+    settings.valid().then_some(settings)
+}
+
+fn write_system_copy(path: &Path, settings: &Settings) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("system configuration has no parent"))?;
+    fs::create_dir_all(parent)?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o755))?;
+    write_settings(path, settings, 0o644)
+}
+
+pub fn publish_for_pacman(settings: &Settings) -> io::Result<()> {
+    write_system_copy(Path::new(SYSTEM_CONFIG), settings)
 }
 
 fn load_path(path: &Path) -> io::Result<Settings> {
     match fs::read(path) {
         Ok(bytes) => {
-            if let Ok(yaml) = std::str::from_utf8(&bytes) {
-                if let Ok(settings) = serde_saphyr::from_str::<Settings>(yaml) {
-                    if settings.valid() {
-                        return Ok(settings);
-                    }
-                }
+            if let Some(settings) = parse_settings(&bytes) {
+                return Ok(settings);
             }
             eprintln!(
                 "RustyPac: invalid configuration at {}; replacing with defaults",
@@ -94,6 +135,11 @@ fn load_path(path: &Path) -> io::Result<Settings> {
         Err(error) => return Err(error),
     }
     let settings = Settings::default();
+    write_settings(path, &settings, 0o600)?;
+    Ok(settings)
+}
+
+fn write_settings(path: &Path, settings: &Settings, mode: u32) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -101,8 +147,59 @@ fn load_path(path: &Path) -> io::Result<Settings> {
     fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(b"# RustyPac download settings. Sizes/speed are bytes and bytes/sec (0 = unlimited).\n# resume: false restarts incomplete files. Connections are capped by the smaller limit.\n# Pacman's XferCommand supplies one file at a time; parallel package files are not supported.\n")?;
-    let yaml = serde_saphyr::to_string(&settings).map_err(io::Error::other)?;
+    let yaml = serde_saphyr::to_string(settings).map_err(io::Error::other)?;
     temporary.write_all(yaml.as_bytes())?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(mode))?;
     temporary.persist(path).map_err(|error| error.error)?;
-    Ok(settings)
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inaccessible_home_uses_shared_settings_without_rewriting_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let unusable_home = directory.path().join("not-a-directory");
+        fs::write(&unusable_home, b"leave alone").unwrap();
+        let shared = directory.path().join("system.yaml");
+        let yaml = "# shared settings\nresume: false\nconnections_per_file: 7\n";
+        fs::write(&shared, yaml).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o444)).unwrap();
+        let settings = load_implicit(&unusable_home.join("config.yaml"), &shared).unwrap();
+        assert!(!settings.resume);
+        assert_eq!(settings.connections_per_file, 7);
+        assert_eq!(fs::read_to_string(shared).unwrap(), yaml);
+    }
+
+    #[test]
+    fn publishing_makes_a_readable_copy_of_selected_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = directory.path().join("RustyPac/config.yaml");
+        let settings = Settings {
+            connections_per_file: 9,
+            resume: false,
+            ..Settings::default()
+        };
+        write_system_copy(&shared, &settings).unwrap();
+        let actual: Settings =
+            serde_saphyr::from_str(&fs::read_to_string(&shared).unwrap()).unwrap();
+        assert_eq!(actual.connections_per_file, 9);
+        assert!(!actual.resume);
+        assert_eq!(
+            fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::metadata(shared.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
 }

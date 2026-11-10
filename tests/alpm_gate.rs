@@ -151,7 +151,7 @@ fn sudo_remove_directory(directory: &std::path::Path) -> Result<(), String> {
 
 #[test]
 #[ignore = "requires the alpm user, passwordless sudo, and a prebuilt release binary"]
-fn release_binary_writes_exact_absolute_part_output_as_alpm() {
+fn release_binary_downloads_as_alpm_with_inherited_root_home() {
     let expected = body(1024 * 1024 + 17);
     let server = HttpServer::spawn(ServerConfig::new(
         "/package.pkg.tar.zst",
@@ -171,10 +171,7 @@ fn release_binary_writes_exact_absolute_part_output_as_alpm() {
 
     let status = Command::new("sudo")
         .args(["-n", "-u", "alpm", "--", "env"])
-        .arg(format!(
-            "RUSTYPAC_CONFIG={}",
-            directory.path().join("config.yaml").display()
-        ))
+        .args(["HOME=/root", "RUSTYPAC_CONFIG="])
         .arg(&binary)
         .arg(server.url("/package.pkg.tar.zst"))
         .arg(&output)

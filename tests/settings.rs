@@ -10,6 +10,10 @@ use http_server::{HttpServer, ResponseMode, ServerConfig};
 use tempfile::tempdir;
 
 fn transfer(home: &Path, config: Option<&Path>, server: &HttpServer) -> Output {
+    transfer_to(home, config, &home.join("file.part"), server)
+}
+
+fn transfer_to(home: &Path, config: Option<&Path>, output: &Path, server: &HttpServer) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_RustyPac"));
     command.env("HOME", home).env_remove("RUSTYPAC_CONFIG");
     if let Some(config) = config {
@@ -17,7 +21,7 @@ fn transfer(home: &Path, config: Option<&Path>, server: &HttpServer) -> Output {
     }
     command
         .arg(server.url("/file"))
-        .arg(home.join("file.part"))
+        .arg(output)
         .output()
         .unwrap()
 }
@@ -142,6 +146,18 @@ fn disable_is_not_blocked_by_an_unreadable_download_config() {
         !String::from_utf8_lossy(&result.stderr).contains("failed to load configuration"),
         "must allow disabling integration even when download settings are unreadable"
     );
+}
+
+#[test]
+fn unusable_inherited_home_does_not_prevent_a_download() {
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("inherited-home");
+    fs::write(&home, b"not a usable home directory").unwrap();
+    let output = directory.path().join("file.part");
+    let result = transfer_to(&home, None, &output, &server(4096));
+    assert!(result.status.success(), "{result:?}");
+    assert_eq!(fs::read(output).unwrap(), vec![42; 4096]);
+    assert_eq!(fs::read(home).unwrap(), b"not a usable home directory");
 }
 
 #[test]

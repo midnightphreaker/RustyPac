@@ -47,6 +47,8 @@ XferCommand = /usr/local/bin/RustyPac %u %o
 # ... remaining options and repository definitions ...
 ```
 
+When run as root, `--enable` also writes the selected download settings to `/etc/RustyPac/config.yaml`, with directory mode `0755` and file mode `0644`, so pacman's download account can read them. This copy is refreshed even when RustyPac is already active. It contains download settings only; do not put credentials in it.
+
 Disable RustyPac with:
 
 ```sh
@@ -92,7 +94,10 @@ $HOME/.config/RustyPac/config.yaml
 - **Missing file:** creates the directory and writes the defaults below.
 - **Valid file:** reads your settings without rewriting the file or removing comments. Omitted settings use defaults.
 - **Corrupt or invalid file:** warns and replaces it with defaults. This includes malformed YAML, unknown setting names, wrong types, and out-of-range values.
-- **I/O error:** reports the problem and stops, rather than overwriting an unreadable file.
+- **Unavailable default home configuration:** reads `/etc/RustyPac/config.yaml` without modifying it. If no valid shared copy is readable, warns and uses built-in defaults so package downloads can proceed.
+- **Explicit `RUSTYPAC_CONFIG` path:** I/O errors are reported and stop the command; an explicitly requested file is never silently ignored.
+
+The fallback also applies when `HOME` is unset. This matters because pacman can run RustyPac as `alpm` while retaining `HOME=/root`; the download account must not need access to `/root`.
 
 Settings are read on each invocation; no rebuild or service restart is needed. `--disable` works independently of the download configuration.
 
@@ -125,15 +130,21 @@ Increasing only one limit leaves the other as the cap. Files below `min_split_si
 
 Keep `resume: true` to reuse valid incomplete-download checkpoints. Set `resume: false` to download incomplete files again from the beginning. Resume depends on a known-length transfer and valid bytehaul state; an arbitrary existing `.part` file alone does not guarantee resume.
 
-### Selecting the configuration when using sudo
+### Configuration for pacman and yay
 
-The path uses the **process's HOME**: `sudo` commonly changes it to `/root`, so normal-user and sudo invocations can use different files. `RUSTYPAC_CONFIG=/absolute/path/config.yaml` overrides the location. For example, to make a sudo pacman invocation use your existing user config explicitly:
+Personal settings normally live at `$HOME/.config/RustyPac/config.yaml`. Pacman's unprivileged download account may not be able to access that home directory. **Do not copy configuration into `/root` or loosen `/root` permissions to fix this.** RustyPac falls back to the shared copy at `/etc/RustyPac/config.yaml`, then to built-in defaults if necessary.
+
+To publish your existing personal configuration for pacman's download account, run this once after installation, and again after changing your personal settings:
 
 ```sh
-sudo env RUSTYPAC_CONFIG="$HOME/.config/RustyPac/config.yaml" pacman -Syu
+sudo env RUSTYPAC_CONFIG="$HOME/.config/RustyPac/config.yaml" /usr/local/bin/RustyPac --enable
 ```
 
-Create/edit the user file as your normal user first; if root creates it through this override, it will be root-owned. Paths must be accessible to the account running RustyPac.
+This validates your selected file and writes a readable settings copy under `/etc/RustyPac`. A normal `sudo /usr/local/bin/RustyPac --enable` also creates the shared copy, but selects settings using that process's `HOME`. If root creates a missing personal file through the explicit override, it will be root-owned; create/edit your personal file as your normal user first.
+
+After publishing, use `yay` or `sudo pacman` normally—no environment override is needed on each run. For downloads using the shared copy, it can also be edited directly with `sudoedit /etc/RustyPac/config.yaml`. Republishing replaces that copy with the selected personal settings.
+
+`RUSTYPAC_CONFIG=/absolute/path/config.yaml` remains available for direct use. An explicitly supplied path must be accessible to the account running RustyPac; unlike the implicit home path, failure to access it is an error.
 
 ### Parallel package files: pacman limitation
 
@@ -174,6 +185,7 @@ sudo pacman -Syy vim --noconfirm
 
 ## Limitations and troubleshooting
 
+- If an older binary fails on `/root/.config/RustyPac/config.yaml: Permission denied`, install the updated binary and publish the shared config with `--enable` as described above. Changing ownership of files inside `/root` does not make that parent directory accessible. To recover immediately without updating RustyPac, run `sudo /usr/local/bin/RustyPac --disable` and use pacman's built-in downloader.
 - Unknown-length responses are downloaded in one stream and do not promise resume.
 - There is no aria2 control-file compatibility or fallback, daemon, GUI, mirror manager, package-manager features, or live connection count.
 - If pacman cannot execute RustyPac, confirm `/usr/local/bin/RustyPac` exists and remains readable/executable by `alpm`, then check `pacman-conf XferCommand`.

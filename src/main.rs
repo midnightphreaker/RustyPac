@@ -36,6 +36,12 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if command == Command::Enable && unsafe { libc::geteuid() } == 0 {
+        if let Err(error) = settings::publish_for_pacman(&settings) {
+            eprintln!("RustyPac: failed to write /etc/RustyPac/config.yaml: {error}");
+            return ExitCode::from(1);
+        }
+    }
     match command {
         Command::Download { url, output } => run_download(&url, &output, &settings),
         Command::Enable => run_config_interaction(true),
